@@ -12,9 +12,9 @@ supp_definitions: supp_definition* supp_definition
                | types_definition
                | constants_definition
                | predicates_definition
-               | feature_definition
                | predicate_group_definition
                | action_definition
+               | action_definition2
                | axiom_definition
                | derived_definition
                | generator_definition
@@ -40,27 +40,30 @@ parent_type_name: object_type_name | value_type_name
 constants_definition: "(" ":" "constants" allconstant+ ")"
 
 // predicates
-predicates_definition: "(" ":" "predicates" predicate_definition+ ")"
+predicates_definition: "(" ":" "predicates" (predicate_definition|predicate_definition2)+ ")"
 predicate_definition: "(" predicate_name allvariable* ")"
+predicate_definition2: "(" predicate_name allvariable* "->" object_type_name_unwrapped  ")"
 predicate_name: CONSTNAME ("[" decorator_kwargs "]")?
 
 // features
-feature_definition: "(" ":" "feature" feature_name feature_parameters feature_output feature_expr ")"
-feature_name: VARNAME ("[" decorator_kwargs "]")?
-feature_parameters: ":" "parameters" "(" allvariable* ")"
-?feature_output: ":" "output" "(" value_type_name_unwrapped ")"
-feature_expr: (":" "expr" expr)?
+// feature_definition: "(" ":" "feature" feature_name feature_parameters feature_output feature_expr ")"
+// feature_name: VARNAME ("[" decorator_kwargs "]")?
+// feature_parameters: ":" "parameters" "(" allvariable* ")"
+// ?feature_output: ":" "output" "(" value_type_name_unwrapped ")"
+// feature_expr: (":" "expr" expr)?
 
 // predicate group
 predicate_group_definition: "(" ":" "predicate-group" predicate_group_name predicate_name* ")"
 predicate_group_name: VARNAME
 
 // actions
-action_definition: "(" ":" "action" action_name action_parameters action_precondition action_effect ")"
+action_definition:  "(" ":" "action" action_name action_parameters? action_precondition? action_effect? ")"
+action_definition2: "(" ":" "action" action_name action_extends action_parameters? action_precondition? action_effect? ")"
 action_name: VARNAME ("[" decorator_kwargs "]")?
 action_parameters: ":" "parameters" "(" allvariable* ")"
 action_precondition: ":" "precondition" expr_function_call
 action_effect: ":" "effect" expr_function_call
+?action_extends: ":" "extends" VARNAME
 
 // axioms
 axiom_definition: "(" ":" "axiom" axiom_decorator axiom_vars axiom_context axiom_implies ")"
@@ -70,9 +73,10 @@ axiom_context: ":" "context" expr_function_call
 axiom_implies: ":" "implies" expr_function_call
 
 // derived_definition
-derived_definition: "(" ":" "derived" derived_signature expr_function_call ")"
-derived_signature: "(" derived_name allvariable* ")"
-derived_name: VARNAME ("[" decorator_kwargs "]")?
+derived_definition: "(" ":" "derived" (derived_signature1|derived_signature2) expr_function_call ")"
+derived_signature1: "(" derived_name allvariable* ")"
+derived_signature2: "(" derived_name allvariable* "->" object_type_name_unwrapped  ")"
+derived_name: CONSTNAME ("[" decorator_kwargs "]")?
 
 // generator definition
 generator_definition: "(" ":" "generator" generator_name generator_parameters generator_certifies generator_context generator_generates ")"
@@ -156,7 +160,7 @@ list: "[" "]"
 
 function_call: "(" (function_name|method_name) expr* ")"
 simple_function_call: "(" (function_name|method_name) " " (variable | constant)* ")"
-function_name: VARNAME | slot
+function_name: VARNAME ("[" decorator_kwargs "]")? | slot
 method_name: VARNAME SCOPE_SEP VARNAME
 SCOPE_SEP: "::"
 

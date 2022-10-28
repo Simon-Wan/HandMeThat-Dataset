@@ -10,17 +10,19 @@
 
 import os.path as osp
 import itertools
-from typing import Optional, Union, Sequence, Tuple, Set
+import collections
+from typing import Optional, Union, Sequence, Tuple, Set, List
 from lark import Lark, Tree, Transformer, v_args
 
 import jacinle
-import pdsketch.interface.v2.expr as E
-from .value import ValueType, BasicValueType, VectorValueType, BOOL, Variable, StringConstant
+import pdsketch.expr as E
+from .value import ObjectType, ValueType, BasicValueType, VectorValueType, BOOL, Variable, StringConstant, AUTO
 from .state import State
-from .expr import ExpressionDefinitionContext, get_definition_context
-from .domain import Domain, Precondition, Effect, Problem
+from .expr import ExpressionDefinitionContext, get_definition_context, PredicateDef
+from .operator import Precondition, Effect
+from .domain import Domain, Problem
 
-__all__ = ['PDSketchParser', 'load_domain_file', 'parse_domain_string', 'parse_expression', 'load_problem_file', 'PDDLTransformer']
+__all__ = ['PDSketchParser', 'load_domain_file', 'load_domain_string', 'parse_expression', 'load_problem_file', 'PDDLTransformer']
 
 logger = jacinle.get_logger(__file__)
 
@@ -39,7 +41,7 @@ class PDSketchParser(object):
     grammar_file = osp.join(osp.dirname(__file__), 'pdsketch-v2.grammar')
 
     def __init__(self):
-        with open(type(self).grammar_file) as f :
+        with open(type(self).grammar_file) as f:
             self.lark = Lark(f)
 
     def load(self, file):
@@ -77,33 +79,40 @@ class PDSketchParser(object):
 _parser = PDSketchParser()
 
 
-def load_domain_file(filename) -> Domain:
+def load_domain_file(filename: str) -> Domain:
     tree = _parser.load(filename)
     domain = _parser.make_domain(tree)
     return domain
 
 
-def parse_domain_string(domain_string) -> Domain:
+def load_domain_string(domain_string: str) -> Domain:
     tree = _parser.loads(domain_string)
     domain = _parser.make_domain(tree)
     return domain
 
 
-def load_problem_file(filename, domain: Domain, **kwargs) -> Tuple[State, E.ValueOutputExpression]:
+def load_problem_file(filename: str, domain: Domain, **kwargs) -> Tuple[State, E.ValueOutputExpression]:
     tree = _parser.load(filename)
     with ExpressionDefinitionContext(domain=domain).as_default():
         problem = _parser.make_problem(tree, domain, **kwargs)
     return problem.to_state(domain), problem.goal
 
 
-def parse_expression(domain, string, variables) -> E.Expression:
+def parse_problem_string(problem_string: str, domain: Domain, **kwargs) -> Tuple[State, E.ValueOutputExpression]:
+    tree = _parser.loads(problem_string)
+    with ExpressionDefinitionContext(domain=domain).as_default():
+        problem = _parser.make_problem(tree, domain, **kwargs)
+    return problem.to_state(domain), problem.goal
+
+
+def parse_expression(domain: Domain, string: str, variables: Sequence[Variable]) -> E.Expression:
     tree = _parser.loads(string)
     expr = _parser.make_expression(domain, tree, variables)
     return expr
 
 
 class PDDLTransformer(Transformer):
-    def __init__(self, init_domain: Optional[Domain] = None, allow_object_constants: bool = True, ignore_unknown_predicates: bool = False):
+    def __init__(self, init_domain: Domain = None, allow_object_constants: bool = True, ignore_unknown_predicates: bool = False):
         super().__init__()
 
         self.domain = init_domain
@@ -139,12 +148,15 @@ class PDDLTransformer(Transformer):
         else:
             parent_line, parent_name = -1, 'object'
 
+        for lineno, typedef in args:
+            assert typedef is not AUTO, 'AUTO type is not allowed in type definition.'
+
         for arg in args:
             arg_line, arg_name = arg
             if arg_line == parent_line:
-                self.domain.register_type(arg_name, parent_name)
+                self.domain.define_type(arg_name, parent_name)
             else:
-                self.domain.register_type(arg_name, parent_name)
+                self.domain.define_type(arg_name, parent_name)
 
     @inline_args
     def constants_definition(self, *args):
@@ -155,11 +167,26 @@ class PDDLTransformer(Transformer):
         name, kwargs = name
 
         return_type = kwargs.pop('return_type', None)
-        kwargs.setdefault('group', 'basic')
-        if return_type is None:
-            self.domain.register_predicate(name, args, **kwargs)
-        else:
-            self.domain.register_feature(name, args, return_type, **kwargs)
+        self._predicate_definition_inner(name, args, return_type, kwargs)
+
+    @inline_args
+    def predicate_definition2(self, name, *args):
+        name, kwargs = name
+        assert 'return_type' not in kwargs
+        args, return_type = args[:-1], self.domain.types[args[-1]]
+        self._predicate_definition_inner(name, args, return_type, kwargs)
+
+    def _predicate_definition_inner(self, name, args, return_type, kwargs):
+        generators = kwargs.pop('generators', None)
+        predicate_def = self.domain.define_predicate(name, args, return_type, **kwargs)
+
+        if generators is not None:
+            generators: List[str]
+            for target_variable_name in generators:
+                assert target_variable_name.startswith('?')
+                parameters, certifies, context, generates = _canonize_inline_generator_def_predicate(self.domain, target_variable_name, predicate_def)
+                generator_name = f'gen-{predicate_def.name}-{target_variable_name[1:]}' if len(generators) > 1 else f'gen-{predicate_def.name}'
+                self.domain.define_generator(generator_name, parameters, certifies, context, generates)
 
     @inline_args
     def predicate_name(self, name, kwargs=None):
@@ -168,42 +195,27 @@ class PDDLTransformer(Transformer):
         return name.value, kwargs
 
     @inline_args
-    def feature_definition(self, name, parameters, output_type, expr):
-        name, kwargs = name
-        parameters = tuple(parameters.children)
-        if len(expr.children) > 0:
-            expr = expr.children[0]
-            assert isinstance(expr, _FunctionApplicationImm), 'Expression of a feature must be a function: got {}.'.format(type(expr))
-            with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"feature::{name}", precondition_constraints=['augmented-input'], effect_constraints=[]).as_default():
-                expr = expr.compose(output_type)
-        else:
-            expr = None
-        self.domain.register_feature(name, parameters, output_type, expr=expr, **kwargs)
-
-    @inline_args
-    def feature_name(self, name, kwargs=None):
-        if kwargs is None:
-            kwargs = dict()
-        return name.value, kwargs
-
-    @inline_args
     def type_name(self, name):
+        if name.value == 'auto':
+            return name.line, AUTO
         # propagate the "lineno" of the type definition up.
         return name.line, name.value
 
     @inline_args
-    def object_type_name(self, type):
-        return type
+    def object_type_name(self, typedef):
+        return typedef
 
     @inline_args
-    def value_type_name(self, type):
-        lineno, type = type
-        if isinstance(type, VectorValueType):
-            return lineno, type
-        assert isinstance(type, str)
-        if type in self.domain.types:
-            return lineno, self.domain.types[type]
-        return lineno, BasicValueType(type)
+    def value_type_name(self, typedef):
+        lineno, typedef = typedef
+        if typedef is AUTO:
+            return lineno, AUTO
+        if isinstance(typedef, VectorValueType):
+            return lineno, typedef
+        assert isinstance(typedef, str)
+        if typedef in self.domain.types:
+            return lineno, self.domain.types[typedef]
+        return lineno, BasicValueType(typedef)
 
     @inline_args
     def vector_type_name(self, dtype, dim, choices, kwargs=None):
@@ -214,35 +226,105 @@ class PDDLTransformer(Transformer):
         return lineno, VectorValueType(dtype, dim, choices, **kwargs)
 
     @inline_args
-    def object_type_name_unwrapped(self, type):
-        return type[1]
+    def object_type_name_unwrapped(self, typedef):
+        return typedef[1]
 
     @inline_args
-    def value_type_name_unwrapped(self, type):
-        return type[1]
+    def value_type_name_unwrapped(self, typedef):
+        return typedef[1]
 
     @inline_args
     def predicate_group_definition(self, *args):
         raise NotImplementedError()
 
     @inline_args
-    def action_definition(self, name, parameters, precondition, effect):
+    def action_definition(self, name, *defs):
         name, kwargs = name
-        parameters = tuple(parameters.children)
-        precondition = precondition.children[0]
-        effect = effect.children[0]
 
-        with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}", effect_constraints=[]).as_default():
-            precondition = _canonize_precondition(precondition)
-        with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}", effect_constraints=['basic', 'augmented']).as_default():
-            effect = _canonize_effect(effect)
-        self.domain.register_operator(name, parameters, precondition, effect, **kwargs)
+        parameters = tuple()
+        precondition = None
+        effect = None
+
+        for def_ in defs:
+            if isinstance(def_, _ParameterListWrapper):
+                parameters = def_.parameters
+            elif isinstance(def_, _PreconditionWrapper):
+                precondition = def_.precondition
+            elif isinstance(def_, _EffectWrapper):
+                effect = def_.effect
+            else:
+                raise TypeError('Unknown definition type: {}.'.format(type(def_)))
+
+        if precondition is not None:
+            with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}").as_default():
+                precondition = _canonize_precondition(precondition)
+        else:
+            precondition = list()
+
+        if effect is not None:
+            with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}", is_effect_definition=True).as_default():
+                effect = _canonize_effect(effect)
+        else:
+            effect = list()
+
+        self.domain.define_operator(name, parameters, precondition, effect, **kwargs)
+
+    @inline_args
+    def action_definition2(self, name, extends, *defs):
+        name, kwargs = name
+
+        assert 'extends' not in kwargs, 'Instantiation cannot be set using decorators. Use :extends instead.'
+        kwargs['extends'] = extends
+
+        template_op = self.domain.operators[extends]
+        parameters = template_op.arguments
+
+        precondition = None
+        effect = None
+
+        for def_ in defs:
+            if isinstance(def_, _ParameterListWrapper):
+                parameters += def_.parameters
+            elif isinstance(def_, _PreconditionWrapper):
+                precondition = def_.precondition
+            elif isinstance(def_, _EffectWrapper):
+                effect = def_.effect
+            else:
+                raise TypeError('Unknown definition type: {}.'.format(type(def_)))
+
+        if precondition is not None:
+            with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}").as_default():
+                precondition = tuple(_canonize_precondition(precondition))
+        else:
+            precondition = tuple()
+        if effect is not None:
+            with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"action::{name}", is_effect_definition=True).as_default():
+                effect = tuple(_canonize_effect(effect))
+        else:
+            effect = tuple()
+
+        self.domain.define_operator(name, parameters, template_op.preconditions + precondition, template_op.effects + effect, **kwargs)
+
+    def action_parameters(self, args):
+        return _ParameterListWrapper(tuple(args))
+
+    @inline_args
+    def action_precondition(self, function_call):
+        return _PreconditionWrapper(function_call)
+
+    @inline_args
+    def action_effect(self, function_call):
+        return _EffectWrapper(function_call)
 
     @inline_args
     def action_name(self, name, kwargs=None):
         if kwargs is None:
             kwargs = dict()
         return name.value, kwargs
+
+    @inline_args
+    def action_instantiates(self, name):
+        return name.value
 
     @inline_args
     def axiom_definition(self, decorator, vars, context, implies):
@@ -254,11 +336,11 @@ class PDDLTransformer(Transformer):
         name = kwargs.pop('name', None)
         scope = None if name is None else f"axiom::{name}"
 
-        with ExpressionDefinitionContext(*vars, domain=self.domain, scope=scope, effect_constraints=[]).as_default():
+        with ExpressionDefinitionContext(*vars, domain=self.domain, scope=scope).as_default():
             precondition = _canonize_precondition(precondition)
-        with ExpressionDefinitionContext(*vars, domain=self.domain, scope=scope, effect_constraints=['basic', 'augmented']).as_default():
+        with ExpressionDefinitionContext(*vars, domain=self.domain, scope=scope, is_effect_definition=True).as_default():
             effect = _canonize_effect(effect)
-        self.domain.register_axiom(name, vars, precondition, effect, **kwargs)
+        self.domain.define_axiom(name, vars, precondition, effect, **kwargs)
 
     @inline_args
     def derived_definition(self, signature, expr):
@@ -266,14 +348,26 @@ class PDDLTransformer(Transformer):
         expr = expr
 
         return_type = kwargs.pop('return_type', BOOL)
-        with ExpressionDefinitionContext(*args, domain=self.domain, scope=f"derived::{name}", effect_constraints=[]).as_default():
-            expr = expr.compose(return_type)
-        self.domain.register_derived(name, args, return_type, expr=expr, **kwargs)
+        with ExpressionDefinitionContext(*args, domain=self.domain, scope=f"derived::{name}").as_default():
+            if return_type is AUTO:
+                expr = expr.compose()
+                assert isinstance(expr, (E.VariableExpression, E.ValueOutputExpression))
+                return_type = expr.return_type
+            else:
+                expr = expr.compose(return_type)
+        self.domain.define_derived(name, args, return_type, expr=expr, **kwargs)
 
     @inline_args
-    def derived_signature(self, name, *args):
+    def derived_signature1(self, name, *args):
         name, kwargs = name
         return name, args, kwargs
+
+    @inline_args
+    def derived_signature2(self, name, *args):
+        name, kwargs = name
+        assert 'return_type' not in kwargs, 'Return type cannot be set using decorators.'
+        kwargs['return_type'] = args[-1]
+        return name, args[:-1], kwargs
 
     @inline_args
     def derived_name(self, name, kwargs=None):
@@ -289,17 +383,15 @@ class PDDLTransformer(Transformer):
         context = context.children[0]
         generates = generates.children[0]
 
-        with ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"generator::{name}", effect_constraints=[]).as_default():
-            certifies = certifies.compose(BOOL)
-
-        ctx = ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"generator::{name}", effect_constraints=[])
+        ctx = ExpressionDefinitionContext(*parameters, domain=self.domain, scope=f"generator::{name}")
         with ctx.as_default():
+            certifies = certifies.compose(BOOL)
             assert context.name == 'and'
             context = [_compose(ctx, c) for c in context.arguments]
             assert generates.name == 'and'
             generates = [_compose(ctx, c) for c in generates.arguments]
 
-        self.domain.register_generator(name, parameters, certifies, context, generates, **kwargs)
+        self.domain.define_generator(name, parameters, certifies, context, generates, **kwargs)
 
     @inline_args
     def generator_name(self, name, kwargs=None):
@@ -313,7 +405,7 @@ class PDDLTransformer(Transformer):
 
     @inline_args
     def init_definition_item(self, function_call):
-        if function_call.name not in self.domain.features:
+        if function_call.name not in self.domain.predicates:
             if self.ignore_unknown_predicates:
                 if function_call.name not in self.ignored_predicates:
                     logger.warning(f"Unknown predicate: {function_call.name}.")
@@ -334,6 +426,8 @@ class PDDLTransformer(Transformer):
     @inline_args
     def typedvariable(self, name, typename):
         # name is of type `Variable`.
+        if typename is AUTO:
+            return Variable(name.name, AUTO)
         return Variable(name.name, self.domain.types[typename])
 
     @inline_args
@@ -385,21 +479,23 @@ class PDDLTransformer(Transformer):
         return _Slot(name.children[0].value, kwargs)
 
     @inline_args
-    def function_name(self, name):
-        return name
+    def function_name(self, name, kwargs=None):
+        return name, kwargs
 
     @inline_args
-    def method_name(self, feature_name, _, method_name):
-        return _MethodName(feature_name, method_name)
+    def method_name(self, predicate_name, _, method_name):
+        return _MethodName(predicate_name, method_name), None
 
     @inline_args
     def function_call(self, name, *args):
+        name, kwargs = name
         assert isinstance(name, (str, _MethodName, _Slot))
-        return _FunctionApplicationImm(name, args)
+        return _FunctionApplicationImm(name, args, kwargs=kwargs)
 
     @inline_args
     def simple_function_call(self, name, *args):
-        return _FunctionApplicationImm(name.value, args)
+        name, kwargs = name
+        return _FunctionApplicationImm(name.value, args, kwargs=kwargs)
 
     @inline_args
     def pm_function_call(self, pm_sign, function_call):
@@ -413,10 +509,26 @@ class PDDLTransformer(Transformer):
         return _QuantifierApplicationImm(quantifier, variable, expr)
 
 
+class _ParameterListWrapper(collections.namedtuple('_ParameterListWrapper', 'parameters')):
+    pass
+
+
+class _PreconditionWrapper(collections.namedtuple('_PreconditionWrapper', 'precondition')):
+    pass
+
+
+class _EffectWrapper(collections.namedtuple('_EffectWrapper', 'effect')):
+    pass
+
+
 class _FunctionApplicationImm(object):
-    def __init__(self, name, arguments):
+    def __init__(self, name, arguments, kwargs=None):
         self.name = name
         self.arguments = arguments
+        self.kwargs = kwargs
+
+        if self.kwargs is None:
+            self.kwargs = dict()
 
     def __str__(self):
         arguments_str = ', '.join([str(arg) for arg in self.arguments])
@@ -425,14 +537,14 @@ class _FunctionApplicationImm(object):
     __repr__ = jacinle.repr_from_str
 
     @_log_function
-    def compose(self, expect_value_type: Optional[ValueType] = None, check_function_call_group=True):
+    def compose(self, expect_value_type: Optional[Union[ObjectType, ValueType]] = None):
         ctx = get_definition_context()
         if isinstance(self.name, _Slot):
             assert ctx.scope is not None, 'Cannot define slots inside anonymous actino/axioms.'
 
             name = ctx.scope + '::' + self.name.name
             arguments = self._compose_arguments(ctx, self.arguments)
-            argument_types = [arg.variable if isinstance(arg, E.VariableExpression) else arg.output_type for arg in arguments]
+            argument_types = [arg.variable if isinstance(arg, E.VariableExpression) else arg.return_type for arg in arguments]
             return_type = self.name.kwargs.pop('return_type', None)
             if return_type is None:
                 assert expect_value_type is not None, f'Cannot infer return type for function {name}; please specify by [return_type=Type]'
@@ -440,11 +552,11 @@ class _FunctionApplicationImm(object):
             else:
                 if expect_value_type is not None:
                     assert return_type == expect_value_type, f'Return type mismatch for function {name}: expect {expect_value_type}, got {return_type}.'
-            function_def = ctx.domain.register_external_function(name, argument_types, return_type, kwargs=self.name.kwargs)
+            function_def = ctx.domain.declare_external_function(name, argument_types, return_type, kwargs=self.name.kwargs)
             return E.ExternalFunctionApplication(function_def, *arguments)
         elif isinstance(self.name, _MethodName):
-            assert self.name.feature_name in ctx.domain.features, 'Unkwown feature: {}.'.format(self.name.feature_name)
-            predicate_def = ctx.domain.features[self.name.feature_name]
+            assert self.name.predicate_name in ctx.domain.predicates, 'Unkwown feature: {}.'.format(self.name.predicate_name)
+            predicate_def = ctx.domain.predicates[self.name.predicate_name]
 
             if self.name.method_name == 'equal':
                 nr_index_arguments = len(self.arguments) - 1
@@ -457,20 +569,15 @@ class _FunctionApplicationImm(object):
             else:
                 raise NameError('Unknown method name: {}.'.format(self.name.method_name))
 
-            arguments = self._compose_arguments(ctx, self.arguments[:nr_index_arguments], predicate_def.arguments)
+            arguments = self._compose_arguments(ctx, self.arguments[:nr_index_arguments], predicate_def.arguments, is_variable_list=True)
             with ctx.mark_is_effect_definition(False):
-                value = self._compose_arguments(ctx, [self.arguments[-1]], predicate_def.output_type.assignment_type())[0]
+                value = self._compose_arguments(ctx, [self.arguments[-1]], predicate_def.return_type.assignment_type())[0]
 
-            if isinstance(predicate_def, E.PredicateDef):
-                feature = E.PredicateApplication(predicate_def, *arguments)
-            else:
-                feature = E.FeatureApplication(predicate_def, *arguments)
+            feature = E.PredicateApplication(predicate_def, *arguments)
 
             if self.name.method_name == 'equal':
-                ctx.check_precondition(predicate_def, ctx.scope)
-                return E.FeatureEqualOp(feature, value)
+                return E.PredicateEqualOp(feature, value)
             elif self.name.method_name == 'assign':
-                ctx.check_effect(predicate_def, ctx.scope)
                 return E.AssignOp(feature, value)
             elif self.name.method_name == 'cond-select':
                 with ctx.mark_is_effect_definition(False):
@@ -479,7 +586,6 @@ class _FunctionApplicationImm(object):
             elif self.name.method_name == 'cond-assign':
                 with ctx.mark_is_effect_definition(False):
                     condition = self._compose_arguments(ctx, [self.arguments[-2]], BOOL)[0]
-                ctx.check_effect(predicate_def, ctx.scope)
                 return E.ConditionalAssignOp(feature, value, condition)
             else:
                 raise NameError('Unknown method name: {}.'.format(self.name.method_name))
@@ -497,35 +603,63 @@ class _FunctionApplicationImm(object):
             feature = self.arguments[0]
             feature = _compose(ctx, feature, None)
             value = self.arguments[1]
-            value = _compose(ctx, value, feature.output_type.assignment_type())
-            return E.FeatureEqualOp(feature, value)
+            value = _compose(ctx, value, feature.return_type.assignment_type())
+            return E.PredicateEqualOp(feature, value)
         elif self.name == 'assign':
             assert len(self.arguments) == 2, 'AssignOp takes two arguments, got: {}.'.format(len(self.arguments))
             assert isinstance(self.arguments[0], _FunctionApplicationImm)
-            feature = self.arguments[0].compose(None, check_function_call_group=False)
-            assert isinstance(feature, E.FeatureApplication)
-            ctx.check_effect(feature.function_def, ctx.scope)
-            value = self.arguments[1]
+            feature = self.arguments[0].compose(None)
+            assert isinstance(feature, E.PredicateApplication)
             with ctx.mark_is_effect_definition(False):
-                value = _compose(ctx, value, feature.output_type.assignment_type())
+                value = _compose(ctx, arguments[1], feature.return_type.assignment_type())
             return E.AssignOp(feature, value)
-        elif self.name in ctx.domain.features:
-            predicate_def = ctx.domain.features[self.name]
-            arguments = self._compose_arguments(ctx, self.arguments, predicate_def.arguments)
-            if check_function_call_group:
-                ctx.check_precondition(predicate_def, ctx.scope)
-            if isinstance(predicate_def, E.PredicateDef):
-                return E.PredicateApplication(predicate_def, *arguments)
-            else:
-                return E.FeatureApplication(predicate_def, *arguments)
-        else:
-            raise ValueError('Unknown function: {}.'.format(self.name))
+        else:  # the name is a predicate name.
+            if self.name in ctx.domain.predicates or ctx.allow_auto_predicate_def:
+                if self.name not in ctx.domain.predicates:
+                    arguments: List[Union[E.ValueOutputExpression, E.VariableExpression]] = self._compose_arguments(ctx, self.arguments, None)
+                    for arg in arguments:
+                        assert isinstance(arg, (E.ValueOutputExpression, E.VariableExpression)), f'Cannot infer argument type for predicate {self.name}.'
+                    argument_types = [arg.return_type for arg in arguments]
+                    argument_defs = [Variable(f'arg{i}', arg_type) for i, arg_type in enumerate(argument_types)]
+                    self.kwargs.setdefault('state', False)
+                    self.kwargs.setdefault('observation', False)
+                    generators = self.kwargs.pop('generators', None)
+                    predicate_def = ctx.domain.define_predicate(self.name, argument_defs, BOOL, **self.kwargs)
+                    rv = E.PredicateApplication(predicate_def, *arguments)
+                    logger.info(f'Auto-defined predicate {self.name} with arguments {argument_defs} and return type {BOOL}.')
 
-    def _compose_arguments(self, ctx, arguments, expect_value_type=None):
+                    # create generators inline
+                    if generators is not None:
+                        generators: List[str]
+                        for i, target_variable_name in enumerate(generators):
+                            assert target_variable_name.startswith('?')
+                            parameters, context, generates = _canonize_inline_generator_def(ctx, target_variable_name, arguments)
+                            generator_name = f'gen-{self.name}-{target_variable_name[1:]}' if len(generators) > 1 else f'gen-{self.name}'
+                            ctx.domain.define_generator(generator_name, parameters=parameters, certifies=rv, context=context, generates=generates)
+                    return rv
+                else:
+                    assert len(self.kwargs) == 0, 'Cannot specify decorators for non-auto predicate definition.'
+                    predicate_def = ctx.domain.predicates[self.name]
+                    arguments = self._compose_arguments(ctx, self.arguments, predicate_def.arguments, is_variable_list=True)
+                    return E.PredicateApplication(predicate_def, *arguments)
+            else:
+                raise ValueError('Unknown function: {}.'.format(self.name))
+
+    def _compose_arguments(self, ctx, arguments, expect_value_type=None, is_variable_list: bool = False) -> List[E.Expression]:
         if isinstance(expect_value_type, (tuple, list)):
             assert len(expect_value_type) == len(arguments), 'Mismatched number of arguments: expect {}, got {}. Expression: {}.'.format(len(expect_value_type), len(arguments), self)
-            return [ _compose(ctx, arg, evt) for arg, evt in zip(arguments, expect_value_type) ]
-        return [ _compose(ctx, arg, expect_value_type) for arg in arguments ]
+
+            if is_variable_list:
+                output_list = list()
+                for arg, var in zip(arguments, expect_value_type):
+                    rv = _compose(ctx, arg, var.dtype if var.dtype is not AUTO else None)
+                    if var.dtype is AUTO:
+                        var.dtype = rv.return_type
+                    output_list.append(rv)
+                return output_list
+
+            return [_compose(ctx, arg, evt) for arg, evt in zip(arguments, expect_value_type)]
+        return [_compose(ctx, arg, expect_value_type) for arg in arguments]
 
 
 def _compose(ctx, arg, evt=None):
@@ -555,12 +689,12 @@ class _Slot(object):
 
 
 class _MethodName(object):
-    def __init__(self, feature_name, method_name):
-        self.feature_name = feature_name
+    def __init__(self, predicate_name, method_name):
+        self.predicate_name = predicate_name
         self.method_name = method_name
 
     def __str__(self):
-        return f'{self.feature_name}::{self.method_name}'
+        return f'{self.predicate_name}::{self.method_name}'
 
 
 class _QuantifierApplicationImm(object):
@@ -622,7 +756,7 @@ def _canonize_effect(effect: Union[_FunctionApplicationImm, _QuantifierApplicati
         elif effect.name == 'not':
             assert len(effect.arguments) == 1, 'NotOp only takes 1 argument, got {}.'.format(len(effect.arguments))
             feat = effect.arguments[0].compose()
-            assert feat.output_type == BOOL
+            assert feat.return_type == BOOL
             effect = E.AssignOp(feat, E.ConstantExpression.FALSE)
         elif effect.name == 'when':
             assert len(effect.arguments) == 2, 'WhenOp takes two arguments, got: {}.'.format(len(effect.arguments))
@@ -635,11 +769,11 @@ def _canonize_effect(effect: Union[_FunctionApplicationImm, _QuantifierApplicati
             effect = list()
             for e in inner_effects:
                 assert isinstance(e.assign_expr, E.AssignOp)
-                effect.append(Effect(E.ConditionalAssignOp(e.assign_expr.feature, e.assign_expr.value, condition)))
+                effect.append(Effect(E.ConditionalAssignOp(e.assign_expr.predicate, e.assign_expr.value, condition)))
             return effect
         else:
             feat = effect.compose()
-            assert isinstance(feat, E.FeatureApplication) and feat.output_type == BOOL
+            assert isinstance(feat, E.PredicateApplication) and feat.return_type == BOOL
             effect = E.AssignOp(feat, E.ConstantExpression.TRUE)
 
     if isinstance(effect, list):
@@ -647,4 +781,54 @@ def _canonize_effect(effect: Union[_FunctionApplicationImm, _QuantifierApplicati
 
     assert isinstance(effect, E.VariableAssignmentExpression)
     return [Effect(effect)]
+
+
+def _canonize_inline_generator_def(ctx: ExpressionDefinitionContext, variable_name: str, arguments: List[Union[E.VariableExpression, E.ValueOutputExpression]]):
+    parameters, context, generates = list(), list(), list()
+    used_parameters = set()
+
+    for arg in arguments:
+        if isinstance(arg, E.VariableExpression):
+            if arg.name not in used_parameters:
+                used_parameters.add(arg.name)
+                parameters.append(arg.variable)
+            if arg.name == variable_name:
+                generates.append(arg)
+            else:
+                context.append(arg)
+        else:
+            context.append(arg)
+            assert isinstance(arg, E.ValueOutputExpression)
+            for sub_expr in E.iter_exprs(arg):
+                if isinstance(sub_expr, E.VariableExpression):
+                    if sub_expr.name not in used_parameters:
+                        used_parameters.add(sub_expr.name)
+                        parameters.append(sub_expr.variable)
+
+    assert len(generates) == 1, f'Generator must generate exactly one variable, got {len(generates)}.'
+    return parameters, context, generates
+
+
+def _canonize_inline_generator_def_predicate(domain: Domain, variable_name: str, predicate_def: PredicateDef):
+    parameters = predicate_def.arguments
+    context, generates = list(), list()
+
+    if predicate_def.return_type != BOOL:
+        for arg in parameters:
+            assert arg.name != '?rv', 'Arguments cannot be named ?rv.'
+        parameters = parameters + (Variable('?rv', predicate_def.return_type),)
+
+    ctx = ExpressionDefinitionContext(*parameters, domain=domain)
+    with ctx.as_default():
+        for arg in predicate_def.arguments:
+            assert isinstance(arg, Variable)
+            if arg.name == variable_name:
+                generates.append(ctx[arg.name])
+            else:
+                context.append(ctx[arg.name])
+        certifies = E.PredicateApplication(predicate_def, *[ctx[arg.name] for arg in predicate_def.arguments])
+        if predicate_def.return_type != BOOL:
+            context.append(ctx['?rv'])
+            certifies = E.PredicateEqualOp(certifies, ctx['?rv'])
+    return parameters, certifies, context, generates
 

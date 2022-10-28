@@ -14,7 +14,7 @@ Strips expressions.
 
 import jacinle
 from typing import Optional, Union, Sequence, Tuple, FrozenSet, Dict
-from pdsketch.interface.v2.value import Variable
+from pdsketch.value import Variable
 
 __all__ = [
     'StripsPredicateName', 'StripsProposition', 'StripsSASProposition', 'StripsState', 'StripsSASState',
@@ -136,12 +136,12 @@ class StripsSASExpression(StripsValueOutputExpression):  #  For all external fun
 
 
 class StripsAssignment(StripsVariableAssignmentExpression):
-    def __init__(self, feature: Union[StripsBoolPredicate, StripsSASPredicate], value: Union[StripsBoolOutputExpression, StripsSASExpression]):
-        self.feature = feature
+    def __init__(self, predicate: Union[StripsBoolPredicate, StripsSASPredicate], value: Union[StripsBoolOutputExpression, StripsSASExpression]):
+        self.predicate = predicate
         self.value = value
 
     def __str__(self):
-        return '({} <- {})'.format(str(self.feature), str(self.value))
+        return '({} <- {})'.format(str(self.predicate), str(self.value))
 
 
 class StripsDeicticAssignment(StripsVariableAssignmentExpression):
@@ -159,8 +159,8 @@ class StripsConditionalAssignment(StripsVariableAssignmentExpression):
         self.condition = condition
 
     @property
-    def feature(self):
-        return self.assign_op.feature
+    def predicate(self):
+        return self.assign_op.predicate
 
     @property
     def value(self):

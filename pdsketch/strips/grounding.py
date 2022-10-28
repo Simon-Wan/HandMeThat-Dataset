@@ -14,13 +14,16 @@ from typing import Optional, Union, Callable, Iterable, Sequence, Iterator, Tupl
 import jacinle
 from jacinle.utils.printing import indent_text
 
-import pdsketch.interface.v2.expr as E
-import pdsketch.interface.v2.strips.strips_expr as SE
-from pdsketch.interface.v2.value import BOOL, Value
-from pdsketch.interface.v2.expr import split_simple_bool, flatten_expression, Expression, ExpressionDefinitionContext, ExpressionExecutionContext, FeatureDef
-from pdsketch.interface.v2.state import State
-from pdsketch.interface.v2.domain import OperatorApplier, Domain
-from pdsketch.interface.v2.optimistic import is_optimistic_value
+import pdsketch.expr as E
+import pdsketch.strips.strips_expr as SE
+from pdsketch.value import BOOL, Value, ObjectType, NamedValueType, NamedValueTypeSlot
+from pdsketch.expr import split_simple_bool, flatten_expression, Expression, ExpressionDefinitionContext, ExpressionExecutionContext, PredicateDef, compose_bvdict_args, is_simple_bool, get_simple_bool_def
+from pdsketch.state import State
+from pdsketch.operator import OperatorApplier
+from pdsketch.domain import Domain
+from pdsketch.session import Session
+from pdsketch.optimistic import is_optimistic_value
+# from pdsketch.planner.optimistic_planner import generate_all_partially_grounded_actions
 from .grounded_expr import GStripsClassifier, GStripsAssignmentExpression, GStripsClassifierForwardDiffReturn
 from .grounded_expr import GS_OPTIMISTIC_STATIC_OBJECT, GSOptimisticStaticObjectType
 from .grounded_expr import GStripsBoolConstant, GStripsSimpleClassifier, gstrips_compose_classifiers, gs_is_simple_empty_classifier
@@ -35,11 +38,65 @@ __all__ = [
 ]
 
 
+def generate_all_partially_grounded_actions(
+    session: Session,
+    state: State,
+    action_names: Optional[Sequence[str]] = None,
+    action_filter: Optional[Callable[[OperatorApplier], bool]] = None,
+    filter_static: Optional[bool] = True
+) -> List[OperatorApplier]:
+
+    assert isinstance(session, Session)
+
+    if action_names is not None:
+        action_ops = [session.domain.operators[x] for x in action_names]
+    else:
+        action_ops = session.domain.operators.values()
+
+    actions = list()
+    for op in action_ops:
+        argument_candidates = list()
+        for arg in op.arguments:
+            if isinstance(arg.dtype, ObjectType):
+                argument_candidates.append(state.object_type2names[arg.dtype.typename])
+            else:
+                assert isinstance(arg.dtype, NamedValueType)
+                argument_candidates.append([NamedValueTypeSlot(arg.dtype)])
+        for comb in itertools.product(*argument_candidates):
+            actions.append(op(*comb))
+
+    if filter_static:
+        actions = filter_static_grounding(session, state, actions)
+    if action_filter is not None:
+        actions = list(filter(action_filter, actions))
+    return actions
+
+
+def filter_static_grounding(session: Session, state: State, actions: Sequence[OperatorApplier]) -> List[OperatorApplier]:
+    """Filter out grounded actions that does not satisfy static preconditions."""
+    assert isinstance(session, Session)
+
+    output_actions = list()
+    for action in actions:
+        ctx = ExpressionExecutionContext(session, state, bounded_variables=compose_bvdict_args(action.operator.arguments, action.arguments, state=state, session=session))
+        flag = True
+        with ctx.as_default():
+            for pre in action.operator.preconditions:
+                if is_simple_bool(pre.bool_expr) and get_simple_bool_def(pre.bool_expr).is_static:
+                    rv = pre.bool_expr.forward(ctx).item()
+                    if rv < 0.5:
+                        flag = False
+                        break
+        if flag:
+            output_actions.append(action)
+    return output_actions
+
+
 class GStripsOperator(object):
     def __init__(
         self,
         precondition: GStripsClassifier,
-        effects: Sequence[Union[GStripsSimpleAssignment, GStripsConditionalAssignment]],
+        effects: Sequence[GStripsAssignmentExpression],
         raw_operator: OperatorApplier,
         implicit_propositions: Optional[Set[StripsProposition]] = None
     ):
@@ -133,18 +190,23 @@ class GStripsTask(object):
 
 
 class GStripsTranslatorBase(object):
-    def __init__(self, domain: Domain, use_string_name: bool = True, prob_goal_threshold: float = 0.5, use_derived_predicates: bool = False):
-        self.domain = domain
+    def __init__(self, session: Session, use_string_name: bool = True, prob_goal_threshold: float = 0.5, use_derived_predicates: bool = False):
+        assert isinstance(session, Session)
+        self.session = session
         self.use_string_name = use_string_name
         self.prob_goal_threshold = prob_goal_threshold
         self.use_derived_predicates = use_derived_predicates
         self.predicate2index = dict()
         self._init_indices()
 
+    @property
+    def domain(self) -> Domain:
+        return self.session.domain
+
     def _init_indices(self):
         raise NotImplementedError()
 
-    def register_grounded_predicate(self, name: str, modifier: Optional[str] = None):
+    def define_grounded_predicate(self, name: str, modifier: Optional[str] = None):
         """Allocate a new identifier for the predicate (with modifier).
 
         Args:
@@ -167,7 +229,7 @@ class GStripsTranslatorBase(object):
     def compile_operator(self, op: OperatorApplier, state: State, is_relaxed=False) -> GStripsOperator:
         raise NotImplementedError()
 
-    def compile_derived_predicate(self, dp: FeatureDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
+    def compile_derived_predicate(self, dp: PredicateDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
         raise NotImplementedError()
 
     def compile_state(self, state: State, forward_derived: bool = False) -> StripsState:
@@ -188,7 +250,7 @@ class GStripsTranslatorBase(object):
     ) -> GStripsTask:
         with jacinle.cond_with(jacinle.time('compile_task::actions'), verbose):
             if actions is None:
-                raise ValueError('actions is required for this standalone version of pdsketch.')
+                actions = generate_all_partially_grounded_actions(self.session, state, filter_static=True)
 
         with jacinle.cond_with(jacinle.time('compile_task::state'), verbose):
             strips_state = self.compile_state(state)
@@ -197,8 +259,8 @@ class GStripsTranslatorBase(object):
         derived_predicates = list()
         if self.use_derived_predicates:
             with jacinle.cond_with(jacinle.time('compile_task::derived_predicates'), verbose):
-                for pred in self.domain.features.values():
-                    if pred.group not in ('basic', 'augmented') and pred.cacheable and pred.output_type == BOOL and not pred.static:
+                for pred in self.domain.predicates.values():
+                    if not pred.is_state_variable and pred.is_cacheable and pred.return_type == BOOL and not pred.is_static:
                         derived_predicates.extend(self.compile_derived_predicate(pred, state, is_relaxed=is_relaxed))
         with jacinle.cond_with(jacinle.time('compile_task::goal'), verbose):
             strips_goal, strips_goal_ip = self.compile_expr(goal_expr, state)
@@ -257,29 +319,29 @@ class GStripsTranslatorBase(object):
 class GStripsTranslatorOptimistic(GStripsTranslatorBase):
     def __init__(
         self,
-        domain: Domain,
+        session: Session,
         use_string_name: Optional[bool] = True,
         prob_goal_threshold: float = 0.5,
     ):
-        super().__init__(domain, use_string_name, prob_goal_threshold)
+        super().__init__(session, use_string_name, prob_goal_threshold)
 
     def _init_indices(self):
         for pred in _find_cached_predicates(self.domain):
-            if pred.output_type == BOOL:
-                self.register_grounded_predicate(pred.name)
-                self.register_grounded_predicate(pred.name, 'not')
+            if pred.return_type == BOOL:
+                self.define_grounded_predicate(pred.name)
+                self.define_grounded_predicate(pred.name, 'not')
             else:
-                self.register_grounded_predicate(pred.name, 'initial')
-                self.register_grounded_predicate(pred.name, 'optimistic')
+                self.define_grounded_predicate(pred.name, 'initial')
+                self.define_grounded_predicate(pred.name, 'optimistic')
 
     def compose_grounded_predicate(
-        self, ctx: ExpressionExecutionContext, feature_app: E.FeatureApplication,
+        self, ctx: ExpressionExecutionContext, predicate_app: E.PredicateApplication,
         negated: bool = False, optimistic: Optional[bool] = None,
         allow_set: bool = False,
         return_argument_indices: bool = False
     ) -> Union[StripsProposition, Tuple[StripsProposition, List[int]]]:
         arguments = list()
-        for arg_index, arg in enumerate(feature_app.arguments):
+        for arg_index, arg in enumerate(predicate_app.arguments):
             assert isinstance(arg, (E.ObjectConstantExpression, E.VariableExpression))
             if isinstance(arg, E.ObjectConstantExpression):
                 arg = ctx.state.get_typed_index(arg.name)
@@ -288,7 +350,7 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
             else:
                 if arg.variable.name == '??':
                     assert allow_set
-                    arg = list(range(ctx.state.get_nr_objects_by_type(feature_app.feature_def.arguments[arg_index].typename)))
+                    arg = list(range(ctx.state.get_nr_objects_by_type(predicate_app.predicate_def.arguments[arg_index].typename)))
                 else:
                     arg = ctx.get_bounded_variable(arg.variable)
                     if allow_set:
@@ -296,25 +358,25 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
             assert isinstance(arg, list) if allow_set else isinstance(arg, int)
             arguments.append(arg)
 
-        if feature_app.output_type == BOOL:
+        if predicate_app.return_type == BOOL:
             assert optimistic is None
             if allow_set:
                 rv = set(
-                    _format_proposition((self.get_grounded_predicate_indentifier(feature_app.feature_def.name, 'not' if negated else None),) + tuple(args))
+                    _format_proposition((self.get_grounded_predicate_indentifier(predicate_app.predicate_def.name, 'not' if negated else None),) + tuple(args))
                     for args in itertools.product(*arguments)
                 )
             else:
-                rv = _format_proposition((self.get_grounded_predicate_indentifier(feature_app.feature_def.name, 'not' if negated else None),) + tuple(arguments))
+                rv = _format_proposition((self.get_grounded_predicate_indentifier(predicate_app.predicate_def.name, 'not' if negated else None),) + tuple(arguments))
         else:
             assert not negated and optimistic is not None
             modifier = 'optimistic' if optimistic else 'initial'
             if allow_set:
                 rv = set(
-                    _format_proposition((self.get_grounded_predicate_indentifier(feature_app.feature_def.name, modifier),) + tuple(args))
+                    _format_proposition((self.get_grounded_predicate_indentifier(predicate_app.predicate_def.name, modifier),) + tuple(args))
                     for args in itertools.product(*arguments)
                 )
             else:
-                rv = _format_proposition((self.get_grounded_predicate_indentifier(feature_app.feature_def.name, modifier),) + tuple(arguments))
+                rv = _format_proposition((self.get_grounded_predicate_indentifier(predicate_app.predicate_def.name, modifier),) + tuple(arguments))
 
         if return_argument_indices:
             return rv, arguments
@@ -327,24 +389,24 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
         expr: E.ValueOutputExpression,
         negated: bool = False
     ) -> Tuple[Union[GStripsClassifier, GSOptimisticStaticObjectType], Set[StripsProposition]]:
-        feature_app, this_negated = split_simple_bool(expr, initial_negated=negated)
-        if feature_app is not None:
-            # jacinle.log_function.print(feature_app, this_negated)
-            if feature_app.feature_def.static:
-                if feature_app.output_type == BOOL:
-                    if feature_app.feature_def.name in ctx.state.features:
-                        _, arguments = self.compose_grounded_predicate(ctx, feature_app, this_negated, return_argument_indices=True)
-                        init_value = ctx.state.features[feature_app.feature_def.name][tuple(arguments)]
+        predicate_app, this_negated = split_simple_bool(expr, initial_negated=negated)
+        if predicate_app is not None:
+            # jacinle.log_function.print(predicate_app, this_negated)
+            if predicate_app.predicate_def.is_static:
+                if predicate_app.return_type == BOOL:
+                    if predicate_app.predicate_def.name in ctx.state.features:
+                        _, arguments = self.compose_grounded_predicate(ctx, predicate_app, this_negated, return_argument_indices=True)
+                        init_value = ctx.state.features[predicate_app.predicate_def.name][tuple(arguments)]
                     else:
                         init_value = expr.forward(ctx)
                     return GStripsBoolConstant(bool(init_value) ^ this_negated), set()
                 else:
                     return GS_OPTIMISTIC_STATIC_OBJECT, set()
 
-            if feature_app.output_type == BOOL:
-                return GStripsSimpleClassifier(self.compose_grounded_predicate(ctx, feature_app, this_negated, allow_set=True), is_disjunction=True), set()
+            if predicate_app.return_type == BOOL:
+                return GStripsSimpleClassifier(self.compose_grounded_predicate(ctx, predicate_app, this_negated, allow_set=True), is_disjunction=True), set()
             else:
-                return GStripsSimpleClassifier(self.compose_grounded_predicate(ctx, feature_app, this_negated, optimistic=True, allow_set=True), is_disjunction=True), set()
+                return GStripsSimpleClassifier(self.compose_grounded_predicate(ctx, predicate_app, this_negated, optimistic=True, allow_set=True), is_disjunction=True), set()
         elif E.is_not_expr(expr):
             return self.compose_grounded_classifier(ctx, expr.arguments[0], negated=not negated)
         elif E.is_and_expr(expr) and not negated or E.is_or_expr(expr) and negated:
@@ -375,14 +437,14 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
         elif isinstance(expr, E.ConditionalSelectOp):
             classifiers = [
                 self.compose_grounded_classifier(ctx, expr.condition),
-                self.compose_grounded_classifier(ctx, expr.feature)
+                self.compose_grounded_classifier(ctx, expr.predicate)
             ]
             return gstrips_compose_classifiers(classifiers, is_disjunction=False)
-        elif isinstance(expr, E.FeatureEqualOp):
-            argument_values = [self.compose_grounded_classifier(ctx, arg) for arg in [expr.feature, expr.value]]
+        elif isinstance(expr, E.PredicateEqualOp):
+            argument_values = [self.compose_grounded_classifier(ctx, arg) for arg in [expr.predicate, expr.value]]
             has_optimistic_object = any(c[0] == GS_OPTIMISTIC_STATIC_OBJECT for c in argument_values)
             if has_optimistic_object:
-                if expr.output_type == BOOL:
+                if expr.return_type == BOOL:
                     return GStripsBoolConstant(True), _extract_all_propositions(argument_values)
                 else:
                     return GS_OPTIMISTIC_STATIC_OBJECT, _extract_all_propositions(argument_values)
@@ -397,14 +459,14 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
             argument_values = [self.compose_grounded_classifier(ctx, arg) for arg in expr.arguments]
             # jacinle.log_function.print(argument_values)
             if GS_OPTIMISTIC_STATIC_OBJECT in argument_values:
-                if expr.output_type == BOOL:
+                if expr.return_type == BOOL:
                     return GStripsBoolConstant(True), _extract_all_propositions(argument_values)
                 else:
                     return GS_OPTIMISTIC_STATIC_OBJECT, _extract_all_propositions(argument_values)
 
             argument_values = [argv for argv in argument_values if not gs_is_simple_empty_classifier(argv)]
             # jacinle.log_function.print('computing initial value.')
-            if expr.output_type == BOOL:
+            if expr.return_type == BOOL:
                 # Theoretically, we can compute these values bottom-up together with the transformation.
                 # In practice, this requires much more code to do...
                 init_value = expr.forward(ctx)
@@ -416,7 +478,7 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
             else:
                 return gstrips_compose_classifiers(argument_values, is_disjunction=True)
         elif isinstance(expr, E.VariableExpression):
-            assert expr.output_type != BOOL
+            assert expr.return_type != BOOL
             assert isinstance(ctx.get_bounded_variable(expr.variable), Value), 'Most likely you are accessing a non-optimistic object.'
             assert is_optimistic_value(ctx.get_bounded_variable(expr.variable).item())
             return GS_OPTIMISTIC_STATIC_OBJECT, set()
@@ -435,8 +497,8 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
         outputs = list()
         for assign_expr in assignments:
             if isinstance(assign_expr, E.AssignOp):
-                feat = assign_expr.feature
-                if feat.output_type == BOOL:
+                feat = assign_expr.predicate
+                if feat.return_type == BOOL:
                     assert E.is_constant_bool_expr(assign_expr.value)
                     if assign_expr.value.value.item():
                         add_effects.add(self.compose_grounded_predicate(ctx, feat, negated=False))
@@ -452,9 +514,11 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
                     if not is_relaxed:
                         del_effects.add(self.compose_grounded_predicate(ctx, feat, optimistic=False))
                     value, ip = self.compose_grounded_classifier(ctx, assign_expr.value)
-                    implicit_propositions = ip | set(value.iter_propositions())
+                    implicit_propositions = ip
+                    if isinstance(value, GStripsClassifier):
+                        implicit_propositions.update(set(value.iter_propositions()))
             elif isinstance(assign_expr, E.ConditionalAssignOp):
-                assignment, ass_ip = self.compose_grounded_assignment(ctx, [E.AssignOp(assign_expr.feature, assign_expr.value)], is_relaxed=is_relaxed)
+                assignment, ass_ip = self.compose_grounded_assignment(ctx, [E.AssignOp(assign_expr.predicate, assign_expr.value)], is_relaxed=is_relaxed)
                 condition_classifier, cond_ip = self.compose_grounded_classifier(ctx, assign_expr.condition)
                 outputs.append(GStripsConditionalAssignment(condition_classifier, assignment[0]))
                 implicit_propositions = cond_ip | ass_ip
@@ -476,7 +540,7 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
     def compile_expr(self, expr: Union[str, Expression], state: State) -> Tuple[GStripsClassifier, Set[StripsProposition]]:
         expr = self.domain.parse(expr)
         expr = flatten_expression(expr)
-        ctx = ExpressionExecutionContext(self.domain, state, {})
+        ctx = ExpressionExecutionContext(self.session, state, {})
         return self.compose_grounded_classifier(ctx, expr)
 
     def compile_operator(self, op: OperatorApplier, state: State, is_relaxed=False) -> GStripsOperator:
@@ -497,10 +561,7 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
             effects = op.operator.flatten_effects
 
         # print('  precondition: {}'.format(precondition))
-        ctx = ExpressionExecutionContext(self.domain, state, state.compose_bounded_variables(
-            op.operator.arguments,
-            op.arguments
-        ))
+        ctx = ExpressionExecutionContext(self.session, state, compose_bvdict_args(op.operator.arguments, op.arguments, state=state, session=self.session))
         precondition, pre_ip = self.compose_grounded_classifier(ctx, precondition)
         effects, eff_ip = self.compose_grounded_assignment(ctx, effects, is_relaxed=is_relaxed)
         # print('  compiled precondition: {}'.format(precondition))
@@ -509,9 +570,9 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
     def compile_state(self, state: State, forward_derived: bool = False) -> StripsState:
         predicates = set()
         for name, feature in state.features.items():
-            if self.domain.features[name].static:
+            if self.domain.predicates[name].is_static:
                 continue
-            if self.domain.features[name].group not in ('basic', 'augmented'):
+            if not self.domain.predicates[name].is_state_variable:
                 continue
             if feature.dtype == BOOL:
                 for args, v in _iter_value(feature):
@@ -524,7 +585,7 @@ class GStripsTranslatorOptimistic(GStripsTranslatorBase):
                     predicates.add(_format_proposition((self.get_grounded_predicate_indentifier(name, 'initial'),) + args))
         return StripsState(predicates)
 
-    def compile_derived_predicate(self, dp: FeatureDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
+    def compile_derived_predicate(self, dp: PredicateDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
         raise NotImplementedError('Derived predicates are not supported in Optimistic GStrips translation.')
 
     def relevance_analysis(self, task: GStripsTask, relaxed_relevance: bool = False, forward: bool = True, backward: bool = True) -> GStripsTask:
@@ -537,23 +598,23 @@ GStripsTranslator = GStripsTranslatorOptimistic
 class GStripsTranslatorSAS(GStripsTranslatorBase):
     def __init__(
         self,
-        domain: Domain,
+        session: Session,
         use_string_name: Optional[bool] = True,
         prob_goal_threshold: float = 0.5,
-        cache_bool_features: bool = False
+        cache_bool_predicates: bool = False
     ):
-        self.cache_bool_features = cache_bool_features
-        super().__init__(domain, use_string_name, prob_goal_threshold, use_derived_predicates=cache_bool_features)
+        self.cache_bool_predicates = cache_bool_predicates
+        super().__init__(session, use_string_name, prob_goal_threshold, use_derived_predicates=cache_bool_predicates)
 
     def _init_indices(self):
-        for pred in _find_cached_predicates(self.domain, allow_cacheable_bool=self.cache_bool_features):
-            if pred.output_type == BOOL:
-                self.register_grounded_predicate(pred.name)
-                self.register_grounded_predicate(pred.name, 'not')
+        for pred in _find_cached_predicates(self.domain, allow_cacheable_bool=self.cache_bool_predicates):
+            if pred.return_type == BOOL:
+                self.define_grounded_predicate(pred.name)
+                self.define_grounded_predicate(pred.name, 'not')
             else:
                 for i in range(pred.ao_discretization.size):
-                    self.register_grounded_predicate(f'{pred.name}@{i}')
-                    self.register_grounded_predicate(f'{pred.name}@{i}', 'not')
+                    self.define_grounded_predicate(f'{pred.name}@{i}')
+                    self.define_grounded_predicate(f'{pred.name}@{i}', 'not')
 
     def compose_grounded_predicate_strips(
         self, ctx:ExpressionExecutionContext, feature_app: SE.StripsBoolPredicate,
@@ -564,8 +625,8 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
             argument_indices.append(ctx.get_bounded_variable(arg))
 
         feature_name = feature_app.sas_name if isinstance(feature_app, SE.StripsSASPredicate) else feature_app.name
-        feature_def = self.domain.features[feature_name]
-        if feature_def.static:
+        predicate_def = self.domain.predicates[feature_name]
+        if predicate_def.is_static:
             if isinstance(feature_app, SE.StripsSASPredicate):
                 value = ctx.state.features[feature_name].tensor_indices[tuple(argument_indices)]
                 return GStripsBoolConstant(value.item() == feature_app.sas_index ^ negated ^ feature_app.negated)
@@ -576,7 +637,7 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         predicate_name = self.get_grounded_predicate_indentifier(feature_app.name, 'not' if negated ^ feature_app.negated else None)
         return GStripsSimpleClassifier({_format_proposition((predicate_name, ) + tuple(argument_indices))})
 
-    def compose_grounded_predicate(self, ctx:ExpressionExecutionContext, feature_app: E.FeatureApplication, negated: bool = False) -> Union[GStripsSimpleClassifier, GStripsBoolConstant]:
+    def compose_grounded_predicate(self, ctx:ExpressionExecutionContext, feature_app: E.PredicateApplication, negated: bool = False) -> Union[GStripsSimpleClassifier, GStripsBoolConstant]:
         argument_indices = list()
         for arg_index, arg in enumerate(feature_app.arguments):
             if isinstance(arg, E.ObjectConstantExpression):
@@ -585,15 +646,15 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
                 assert isinstance(arg, E.VariableExpression)
                 arg = ctx.get_bounded_variable(arg.variable)
             argument_indices.append(arg)
-        feature_def = feature_app.feature_def
-        feature_name = feature_def.name
+        predicate_def = feature_app.predicate_def
+        feature_name = predicate_def.name
 
-        if feature_def.static:
+        if predicate_def.is_static:
             value = ctx.state.features[feature_name][tuple(argument_indices)]
             assert value.dtype == BOOL
             return GStripsBoolConstant((value.item() > 0.5) ^ negated)
 
-        predicate_name = self.get_grounded_predicate_indentifier(feature_def.name, 'not' if negated else None)
+        predicate_name = self.get_grounded_predicate_indentifier(predicate_def.name, 'not' if negated else None)
         return GStripsSimpleClassifier({_format_proposition((predicate_name,) + tuple(argument_indices))})
 
     def _compose_grounded_classifier_strips(self, ctx: ExpressionExecutionContext, expr: StripsExpression, negated: bool = False) -> Union[GStripsClassifier, StripsProposition, GSOptimisticStaticObjectType]:
@@ -627,13 +688,13 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         expr: E.ValueOutputExpression,
         negated: bool = False
     ) -> Union[GStripsClassifier, GSOptimisticStaticObjectType]:
-        if isinstance(expr, E.FeatureApplication):
-            feature_def = expr.feature_def
-            assert feature_def.cacheable and feature_def.output_type == BOOL
-            if feature_def.expr is None or self.cache_bool_features:  # a basic predicate.
+        if isinstance(expr, E.PredicateApplication):
+            predicate_def = expr.predicate_def
+            assert predicate_def.is_cacheable and predicate_def.return_type == BOOL
+            if predicate_def.expr is None or self.cache_bool_predicates:  # a basic predicate.
                 return self.compose_grounded_predicate(ctx, expr, negated)
             else:
-                return self._compose_grounded_classifier_strips(ctx, feature_def.ao_discretization, negated)
+                return self._compose_grounded_classifier_strips(ctx, predicate_def.ao_discretization, negated)
         elif E.is_not_expr(expr):
             return self.compose_grounded_classifier(ctx, expr.arguments[0], negated=not negated)
         elif E.is_and_expr(expr) and not negated or E.is_or_expr(expr) and negated:
@@ -690,13 +751,13 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
                     else:
                         raise TypeError('Invalid assignment type: {}.'.format(ass))
             elif isinstance(expr, SE.StripsAssignment):
-                if isinstance(expr.feature, SE.StripsSASPredicate):
+                if isinstance(expr.predicate, SE.StripsSASPredicate):
                     if is_relaxed:
                         raise NotImplementedError('Relaxed assignment to SAS predicate not supported during compilation. First compile it without is_relaxed, and re-run recompile_relaxed_operators.')
-                    feature = expr.feature
+                    feature = expr.predicate
                     feature_name = feature.sas_name
-                    feature_def = self.domain.features[feature_name]
-                    feature_sas_size = feature_def.ao_discretization.size
+                    predicate_def = self.domain.predicates[feature_name]
+                    feature_sas_size = predicate_def.ao_discretization.size
                     assert isinstance(expr.value, SE.StripsSASExpression)
                     argument_indices = list()
                     for arg_index, arg in enumerate(feature.arguments):
@@ -705,7 +766,7 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
                     sas_assignment = GStripsSASAssignment(feature_name, feature_sas_size, argument_indices, expression)
                     outputs.extend(sas_assignment.to_conditional_assignments())
                 else:
-                    feature = expr.feature
+                    feature = expr.predicate
                     value = bool(expr.value)
                     if value:
                         add_effects.add(self.compose_grounded_predicate_strips(ctx, feature))
@@ -722,15 +783,12 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
 
     def compile_expr(self, expr: Union[str, Expression], state: State) -> Tuple[GStripsClassifier, Set[StripsProposition]]:
         expr = self.domain.parse(expr)
-        expr = flatten_expression(expr, flatten_cacheable_bool=not self.cache_bool_features)
-        ctx = ExpressionExecutionContext(self.domain, state, {})
+        expr = flatten_expression(expr, flatten_cacheable_bool=not self.cache_bool_predicates)
+        ctx = ExpressionExecutionContext(self.session, state, {})
         return self.compose_grounded_classifier(ctx, expr), set()
 
     def compile_operator(self, op: OperatorApplier, state: State, is_relaxed=False) -> GStripsOperator:
-        ctx = ExpressionExecutionContext(self.domain, state, state.compose_bounded_variables(
-            op.operator.arguments,
-            op.arguments
-        ))
+        ctx = ExpressionExecutionContext(self.session, state, compose_bvdict_args(op.operator.arguments, op.arguments, state=state, session=self.session))
         preconditions = list()
         for pred in op.operator.preconditions:
             preconditions.append(self._compose_grounded_classifier_strips(ctx, pred.ao_discretization))
@@ -738,17 +796,17 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         effects = self._compose_grounded_assignment_strips(ctx, [eff.ao_discretization for eff in op.operator.effects], is_relaxed)
         return GStripsOperator(precondition, effects, op, implicit_propositions=set())
 
-    def compile_derived_predicate(self, dp: FeatureDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
+    def compile_derived_predicate(self, dp: PredicateDef, state: State, is_relaxed=False) -> List[GStripsDerivedPredicate]:
         arguments = list()
         for arg in dp.arguments:
-            arguments.append(range(state.get_nr_objects_by_type(arg.type.typename)))
+            arguments.append(range(state.get_nr_objects_by_type(arg.dtype.typename)))
 
         rvs = list()
         for arg_indices in itertools.product(*arguments):
             bounded_variables = dict()
             for arg, arg_index in zip(dp.arguments, arg_indices):
                 bounded_variables.setdefault(arg.typename, dict())[arg.name] = arg_index
-            ctx = ExpressionExecutionContext(self.domain, state, bounded_variables)
+            ctx = ExpressionExecutionContext(self.session, state, bounded_variables)
             rvs.append(GStripsDerivedPredicate(
                 dp.name, arg_indices,
                 self._compose_grounded_classifier_strips(ctx, dp.ao_discretization),
@@ -763,18 +821,18 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         # This copying behavior is implemented in the compile_task function. If you are calling this function
         # directly, make sure to copy the state before calling this function.
 
-        if forward_derived and self.cache_bool_features:
-            self.domain.forward_features_and_axioms(state, forward_augmented=False, forward_derived=True, forward_axioms=False)
+        if forward_derived and self.cache_bool_predicates:
+            self.session.forward_predicates_and_axioms(state, forward_state_variables=False, forward_derived=True, forward_axioms=False)
 
         for name, feature in state.features.items():
-            feature_def = self.domain.features[name]
-            if feature_def.group in ('basic', 'augmented') and not (feature_def.output_type == BOOL):
-                state.features[name].tensor_indices = feature_def.ao_discretization.quantize(feature).tensor
+            predicate_def = self.domain.predicates[name]
+            if predicate_def.is_state_variable and not (predicate_def.return_type == BOOL):
+                state.features[name].tensor_indices = predicate_def.ao_discretization.quantize(feature).tensor
 
         predicates = set()
         for name, feature in state.features.items():
-            feature_def = self.domain.features[name]
-            if feature_def.group in ('basic', 'augmented') or (self.cache_bool_features and feature_def.output_type == BOOL):
+            predicate_def = self.domain.predicates[name]
+            if predicate_def.is_state_variable or (self.cache_bool_predicates and predicate_def.return_type == BOOL):
                 if feature.dtype == BOOL:
                     for args, v in _iter_value(feature):
                         if v > 0.5:
@@ -782,7 +840,7 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
                         else:
                             predicates.add(_format_proposition((self.get_grounded_predicate_indentifier(name, 'not'),) + args))
                 else:
-                    codebook = feature_def.ao_discretization
+                    codebook = predicate_def.ao_discretization
                     quantized_feature = codebook.quantize(feature)
                     for args, v in _iter_value(quantized_feature):
                         v = int(v)
@@ -805,8 +863,8 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         verbose: bool = False
     ) -> GStripsTask:
         state = state.clone()
-        if self.cache_bool_features:
-            self.domain.forward_features_and_axioms(state, forward_augmented=True, forward_derived=True, forward_axioms=False)
+        if self.cache_bool_predicates:
+            self.session.forward_predicates_and_axioms(state, forward_state_variables=True, forward_derived=True, forward_axioms=False)
         return super().compile_task(
             state, goal_expr, actions, is_relaxed,
             forward_relevance_analysis=forward_relevance_analysis, backward_relevance_analysis=backward_relevance_analysis,
@@ -817,7 +875,7 @@ class GStripsTranslatorSAS(GStripsTranslatorBase):
         return relevance_analysis_v2(task, relaxed_relevance=relaxed_relevance, forward=forward, backward=backward)
 
 
-def _find_cached_predicates(domain: Domain, allow_cacheable_bool: bool = False) -> Iterable[FeatureDef]:
+def _find_cached_predicates(domain: Domain, allow_cacheable_bool: bool = False) -> Iterable[PredicateDef]:
     """
     Return the set of predicates that are either in the `basic` or the `augmented` group.
     When the flag allow_cacheable_bool is set to True, also return the set of boolean predicates that are cacheable.
@@ -829,10 +887,10 @@ def _find_cached_predicates(domain: Domain, allow_cacheable_bool: bool = False) 
     Returns:
         the set of predicates that are either in the `basic` or the `augmented` group and optionally cacheable boolean predicates.
     """
-    for f in domain.features.values():
-        if f.group in ('basic', 'augmented') and f.cacheable:
+    for f in domain.predicates.values():
+        if f.is_state_variable:
             yield f
-        elif allow_cacheable_bool and f.cacheable and f.output_type == BOOL:
+        elif allow_cacheable_bool and f.is_cacheable and f.return_type == BOOL:
             yield f
 
 

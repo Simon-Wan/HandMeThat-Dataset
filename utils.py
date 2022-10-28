@@ -1,11 +1,11 @@
 import itertools
 from itertools import chain, combinations
 from typing import Optional, Union, Callable, Tuple, Sequence, List, Mapping, Any, Dict
-from pdsketch.interface.v2.value import ObjectType, NamedValueType, NamedValueTypeSlot
-from pdsketch.interface.v2.state import State
-from pdsketch.interface.v2.domain import Domain, OperatorApplier
-# from hacl.pdsketch.interface.v2.planner.basic_planner import filter_static_grounding
-from pdsketch.interface.v2.expr import ExpressionExecutionContext, is_simple_bool, get_simple_bool_def
+from pdsketch.value import ObjectType, NamedValueType, NamedValueTypeSlot
+from pdsketch.state import State
+from pdsketch.domain import Domain
+from pdsketch.operator import OperatorApplier
+from pdsketch.expr import ExpressionExecutionContext, is_simple_bool, get_simple_bool_def
 
 
 def filter_static_grounding(domain, state, actions):

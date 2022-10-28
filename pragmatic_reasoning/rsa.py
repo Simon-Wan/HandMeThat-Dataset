@@ -7,18 +7,6 @@ def get_utterance(meaning_idx, meanings, utterances, hierarchy, probs, depth=10,
     costs = get_utterances_costs(utterances)
     visualize = {'speaker': [], 'listener': []}
     s = get_pragmatic_speaker(visualize, depth, meanings, utterances, hierarchy, probs, costs, alpha)
-    # print(meanings[meaning_idx])
-    # print(utterances)
-    # print(visualize['speaker'])
-    # print(visualize['listener'])
-    '''
-    for mat in visualize['speaker']:
-        output = ''
-        for value in mat[meaning_idx]:
-            output += '%.3f ' % value
-        print(output)
-    '''
-
     utterance_idx = np.random.choice(range(len(utterances)), p=s[meaning_idx])
     return utterance_idx, utterances[utterance_idx]
 

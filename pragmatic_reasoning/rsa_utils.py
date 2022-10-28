@@ -1,4 +1,11 @@
 
+BETA = 0.5
+BETA_query1 = 3.0
+BETA_query2 = 2.0
+C1 = 0.5
+C2 = 10.0
+
+
 def append_dict(dict_list, key, value):
     new_list = dict_list.copy()
     for old_dict in dict_list:

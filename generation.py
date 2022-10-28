@@ -43,7 +43,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
     :param task_idx: index of task under specific goal+quest_type setting
     :param goal_idx: index of goal template
     :param quest_type: type of instruction
-    :return:
+    :return: new_data
     """
     while True:
         print("Try task {}_{}_{}!".format(quest_type, goal_idx, task_idx))
@@ -209,7 +209,7 @@ if __name__ == '__main__':
 
     tasks = range(1000)
     goals = [0]
-    pairs = list(itertools.product([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]))
+    pairs = list(itertools.product([0], [0]))
     mp.Pool(8).map(
         GenerateTasksUnderGoal(args, nodes, hierarchy, domain, valid_positions).generate,
         pairs
