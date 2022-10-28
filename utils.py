@@ -1,4 +1,5 @@
 import itertools
+from itertools import chain, combinations
 from typing import Optional, Union, Callable, Tuple, Sequence, List, Mapping, Any, Dict
 from pdsketch.interface.v2.value import ObjectType, NamedValueType, NamedValueTypeSlot
 from pdsketch.interface.v2.state import State
@@ -187,3 +188,126 @@ def update_object_dict(object_dict, cur_extended_state, names):
             if args[0] == attr:
                 object_dict[names[int(args[1]) + 1]]['states'][attr] = True
     return object_dict
+
+
+def power_set(iterable):
+    s = list(iterable)
+    return list(chain.from_iterable(combinations(s, r) for r in range(len(s) + 1)))
+
+
+def obj_in_dict(obj, any_dict):
+    answer = True
+    for key in any_dict:
+        if key in ['type', 'subclass', 'class']:
+            if any_dict[key] != obj[key]:
+                answer = False
+                break
+        elif key in ['inside', 'ontop']:
+            if key not in obj.keys():
+                answer = False
+                break
+            elif obj[key] != any_dict[key]:
+                answer = False
+                break
+        elif key not in obj['states'].keys():
+            answer = False
+            break
+        elif obj['states'][key] != any_dict[key]:
+            answer = False
+            break
+    return answer
+
+
+def dict_dominate_dict(meaning, utterance, hierarchy):
+    if meaning[0] != utterance[0]:
+        return False
+    if meaning[2] != utterance[2] and utterance[2] is not None:
+        return False
+    answer = True
+    dict1 = meaning[1]
+    dict2 = utterance[1]
+    for key in dict2:
+        if key in ['class', 'subclass', 'type']:
+            if key == 'type':
+                if key not in dict1.keys():
+                    answer = False
+                    break
+                elif dict1[key] != dict2[key]:
+                    answer = False
+                    break
+            elif key == 'subclass':
+                if key not in dict1.keys():
+                    tmp_list = list()
+                    for cls in hierarchy.keys():
+                        if dict2[key] in hierarchy[cls].keys():
+                            tmp_list = hierarchy[cls][dict2[key]]
+                    if 'type' not in dict1.keys():
+                        answer = False
+                        break
+                    elif dict1['type'] not in tmp_list:
+                        answer = False
+                        break
+                elif dict1[key] != dict2[key]:
+                    answer = False
+                    break
+            elif key == 'class':
+                if key not in dict1.keys():
+                    if 'subclass' not in dict1.keys():
+                        if 'type' not in dict1.keys():
+                            answer = False
+                            break
+                        else:
+                            found = False
+                            for subclass in hierarchy[dict2[key]].keys():
+                                if dict1['type'] in hierarchy[dict2[key]][subclass]:
+                                    found = True
+                                    break
+                            if not found:
+                                answer = False
+                                break
+                    elif dict1['subclass'] not in hierarchy[dict2[key]].keys():
+                        answer = False
+                        break
+                elif dict1[key] != dict2[key]:
+                    answer = False
+                    break
+            continue
+        if key not in dict1.keys():
+            answer = False
+            break
+        elif dict1[key] != dict2[key]:
+            answer = False
+            break
+    return answer
+
+
+def get_objects_from_description(object_dict, quest, positions=None):
+    name_list = list()
+    for name in object_dict.keys():
+        if object_dict[name]['class'] == 'LOCATION':
+            continue
+        if obj_in_dict(object_dict[name], quest[1]):
+            name_list.append(name)
+    if quest[0] == 'bring_me':
+        return [(name, None) for name in name_list]
+    elif quest[0] == 'move_to':
+        if quest[2] is None:
+            result = []
+            for pos in positions:
+                result += [(name, pos) for name in name_list]
+            return result
+        return [(name, quest[2]) for name in name_list]
+    else:
+        return [(name, quest[2]) for name in name_list]
+
+
+def get_hardness_level(ag, am, au, ar):
+    if set(am) == set(au):
+        return 1
+    if set(am) == set(ag).intersection(set(au)):
+        return 2
+    if set(am) == set(ag).intersection(set(ar)):
+        return 3
+    return 0
+
+

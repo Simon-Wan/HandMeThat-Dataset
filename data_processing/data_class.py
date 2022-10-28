@@ -25,6 +25,9 @@ class Data:
     def append_action(self, action_name, arguments):
         self.action_list.append({'name': action_name, 'arguments': arguments})
 
+    def set_subgoal(self, subgoal):
+        self._subgoal = subgoal
+
     def set_utterance(self, utterance):
         self.utterance = utterance
 
