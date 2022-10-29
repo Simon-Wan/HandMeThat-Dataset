@@ -1,5 +1,5 @@
-from handmethat.envs.robot_space import ACTION_ARGS
-from handmethat.envs.util import *
+from text_interface.robot_space import ACTION_ARGS
+from text_interface.text_utils import *
 
 
 class Interaction:

@@ -1,12 +1,9 @@
 import json
 import os
 
-from jericho import *
-from jericho.util import *
-from jericho.defines import *
 import numpy as np
 
-from handmethat.envs.env import HMTEnv
+from text_interface.env import HMTEnv
 
 
 class HMTJerichoEnv:

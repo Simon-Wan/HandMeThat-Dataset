@@ -3,10 +3,10 @@ import os.path as osp
 import json
 import numpy as np
 
-from text_env.text_utils import *
-from text_env.robot_actions import *
-from text_env.robot_space import *
-from text_env.env import HMTEnv
+from data_processing.data_class import load_from_json
+from text_interface.robot_actions import *
+from text_interface.robot_space import *
+from text_interface.env import HMTEnv
 
 
 def append_expert_demonstration(json_file):
@@ -100,6 +100,8 @@ def append_expert_demonstration(json_file):
         raise ValueError
     # no need to remove '#' in HMTEnv
     demo_actions = [a.replace('#', ' ') for a in demo_actions]  # simplify: remove '#'
+    env.demo_actions = demo_actions.copy()
+    fully_env.demo_actions = demo_actions.copy()
 
     obs, info = fully_env.reset()
     idx_start = obs.find('The human agent has')
@@ -254,22 +256,20 @@ def generate_expert_demonstrations(raw_data_dir='./raw_data', output_dir='./expe
 
     for root, dirs, files in os.walk(raw_data_dir):
         for file in files:
-            file_name = file.split('_')
-            new_file_name = '_'.join([file_name[1], file_name[0], file_name[2], file_name[3], file_name[4]])
+            # task - quest type - goal idx - task idx - hardness level
             try:
-                with open(osp.join(output_dir, new_file_name), 'r') as f:
-                    print(new_file_name, 'already exists!')
+                with open(osp.join(output_dir, file), 'r') as f:
+                    print(file, 'already exists!')
                     continue
             except:
                 pass
 
             try:
-                data = append_expert_demonstration(osp.join(raw_data_dir, file_name[1], file))
+                data = append_expert_demonstration(osp.join(raw_data_dir, file))
             except ValueError as e:
-                print(e, file_name)
+                print(e, file)
                 continue
-            new_file_name = '_'.join([file_name[1], file_name[0], file_name[2], file_name[3], file_name[4]])
-            with open(osp.join(output_dir, new_file_name), 'w+') as f2:
+            with open(osp.join(output_dir, file), 'w+') as f2:
                 json.dump(data.__dict__, f2)
 
 

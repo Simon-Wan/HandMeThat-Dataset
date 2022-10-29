@@ -1,5 +1,7 @@
-from text_env.robot_actions import *
-from text_env.robot_space import *
+from text_interface.robot_actions import *
+from text_interface.robot_space import *
+from text_interface.text_utils import *
+from data_processing.data_class import load_from_json
 import pdsketch as pds
 import os.path as osp
 
@@ -10,7 +12,8 @@ reward_shaping = False   # todo
 
 class HMTEnv:
     def __init__(self, json_file, fully):
-        self.game, self.demo_actions = load_from_json(json_file)
+        self.game = load_from_json(json_file)
+        self.demo_actions = self.game.demo_actions
         self.object_dict = self.game.current_object_dict.copy()    # unchanged dict
         self.meaning = self.game.get_meaning()
         self.bindings = None
@@ -18,8 +21,9 @@ class HMTEnv:
         self.locations = get_all_locations(self.object_dict)
         self.obj_name_and_article, self.abbr_obj_names = get_obj_name_and_article(self.object_dict)
         self.domain = DOMAIN
+        self.session = pds.Session(self.domain)
         self.names, self.state, self.translator, self.rel_types, self.action_ops, self.strips_state \
-            = set_up_planning_env(self.object_dict, self.domain)
+            = set_up_planning_env(self.object_dict, self.session)
         self.goal = get_meaning_goal(self.meaning, self.game.get_objects_in_meaning(), self.state, self.translator)
         self.interaction = None
 

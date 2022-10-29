@@ -60,3 +60,20 @@ def solve_goal(cur_goal, state, extended_state, strips_operators, translator):
             plan += sub_plan
             sub_plans.append(sub_plan)
     return plan, extended_state, sub_plans
+
+
+def get_subgoal(strips_subgoals, cur_extended_state, meaning_op, strips_operators, translator, subgoal_steps):
+    maximum = 0
+    subgoal_idx = -1
+    for idx, subgoal in enumerate(strips_subgoals):
+        new_task = pds.strips.GStripsTask(meaning_op.apply(cur_extended_state), subgoal, strips_operators, is_relaxed=False)
+        new_task = translator.relevance_analysis(new_task)
+        new_task = new_task.compile()
+        new_heuristic = pds.strips.StripsHFFHeuristic(new_task, translator)
+        new_plan = pds.strips.strips_heuristic_search(new_task, new_heuristic, verbose=False, heuristic_weight=0.7)
+        shorten = subgoal_steps[idx] - len(new_plan)
+        if shorten > maximum:
+            maximum = shorten
+            subgoal_idx = idx
+    return subgoal_idx
+

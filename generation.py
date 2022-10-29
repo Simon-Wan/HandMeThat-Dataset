@@ -6,15 +6,18 @@ import argparse
 import multiprocessing as mp
 import itertools
 import numpy as np
+from copy import deepcopy
 
 from utils import *
 from sampling.scene_sampler import hierarchy2json, get_valid_positions, sample_scene
 from sampling.goal_sampler import generate_one_goal
-from planning.trajectory_generator import solve_goal
+from planning.trajectory_generator import solve_goal, get_subgoal
 from data_processing.data_class import Data, generate_json
 from pragmatic_reasoning.meaning import generate_reasonable_meaning, prob_m_given_g, get_robot_operators_upon_goal, reformat_meanings
 from pragmatic_reasoning.utterance import get_all_utterances, remove_low_probs
 from pragmatic_reasoning.rsa import sample_meaning, get_utterance, estimate_meaning
+
+root = osp.dirname(__file__)
 
 
 def sample_and_define_scene(nodes, hierarchy, session, valid_positions):
@@ -73,15 +76,17 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
 
         cur_extended_state = strips_state.copy()
         update_object_dict(object_dict, cur_extended_state, strips_names)
-        new_data = Data(task_idx, object_dict, cur_goal.expr)
+        new_data = Data(task_idx, deepcopy(object_dict), cur_goal.expr)
+        new_data.goal_idx = goal_idx
 
-        # random truncate
+        # random truncate the trajectory
         remaining_steps = len(plan)
         if remaining_steps < 5:
             stop_step = 0
         else:
             stop_step = np.random.randint((remaining_steps - 4) / 2, remaining_steps - 4)
         solution_idx = 0
+        subgoal_steps = [len(sub_plan) for sub_plan in sub_plans]
         for subgoal_idx, sub_plan in enumerate(sub_plans):
             for simplified_op in sub_plan:
                 if solution_idx >= stop_step and 'hand-empty 0' in cur_extended_state:  # todo: the rule of break
@@ -95,8 +100,8 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
                         break
                 cur_extended_state = extended_op.apply(cur_extended_state)
                 new_data.append_action(extended_op.raw_operator.name, list(extended_op.raw_operator.arguments))
-                new_data.set_subgoal(cur_goal.expr_list[subgoal_idx])
                 remaining_steps -= 1
+                subgoal_steps[subgoal_idx] -= 1
                 solution_idx += 1
         # start query
         if remaining_steps <= 1:
@@ -104,6 +109,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
             continue
 
         # compile the goal after human actions
+        strips_subgoals = [translator.compile_expr(expr, state)[0] for expr in cur_goal.expr_list]
         strips_goal = translator.compile_expr(cur_goal.expr, state)
         strips_goal = strips_goal[0]
         cur_task = pds.strips.GStripsTask(cur_extended_state, strips_goal, strips_operators, is_relaxed=False)
@@ -121,7 +127,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
         new_state.append('is-working_not 0')
         cur_extended_state = frozenset(new_state)
         object_dict = update_object_dict(object_dict, cur_extended_state, strips_names)
-        new_data.current_object_dict = object_dict.copy()
+        new_data.current_object_dict = deepcopy(object_dict)
 
         # get meanings
         meaning_list = generate_reasonable_meaning(object_dict, cur_goal.rel_targets['POSITION'], quest_type)
@@ -152,6 +158,14 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
         objects_in_meaning = get_objects_from_description(object_dict, meaning)
         # objects_in_meaning is A(m)
 
+        meaning_op = robot_operators_dict[quest_type][objects_in_meaning[0]]
+        subgoal_idx = get_subgoal(strips_subgoals, cur_extended_state, meaning_op, strips_operators, translator, subgoal_steps)
+        if subgoal_idx == -1:
+            print('Meaning not correct!')
+            continue
+        subgoal = cur_goal.expr_list[subgoal_idx]
+        new_data.set_subgoal(subgoal)
+
         utterance_idx, utterance = get_utterance(meaning_idx, short_meanings, short_utterances, hierarchy, short_probs)
 
         objects_in_utterance = get_objects_from_description(object_dict, utterance,
@@ -175,10 +189,9 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
 
         new_data.set_answer_objects(objects_in_utterance, objects_in_meaning, useful_objects[quest_type],
                                     objects_in_rsa_meaning)
-        new_data.goal_idx = goal_idx
-        generate_json(new_data, quest_type, osp.join(root, 'raw_data'))
+
+        generate_json(new_data, quest_type, osp.join(root, data_dir))
         print("Task {}_{}_{} finished!".format(quest_type, goal_idx, task_idx))
-        task_idx += 1
         return new_data
 
 
@@ -197,8 +210,10 @@ class GenerateTasksUnderGoal(object):
 
 
 if __name__ == '__main__':
-    root = osp.dirname(__file__)
     parser = argparse.ArgumentParser()
+    parser.add_argument('-g', '--goal', type=int, default=-1, help='goal index')
+    parser.add_argument('-n', '--num', type=int, default=1000, help='number of tasks')
+    parser.add_argument('--offset', type=int, default=0, help='starting index of tasks')
     parser.add_argument('--dirname', type=str, default='raw_data', help='folder to save the raw json files')
     parser.add_argument('--quest_type', type=str, default='bring_me', help='type of instruction')
     args = parser.parse_args()
@@ -208,10 +223,14 @@ if __name__ == '__main__':
     domain = pds.load_domain_file(osp.join(root, 'domain.pddl'))
     session = pds.Session(domain)
 
-    tasks = range(1000)
-    goals = [0]
-    pairs = list(itertools.product([0], [0]))
-    GenerateTasksUnderGoal(args, nodes, hierarchy, session, valid_positions).generate(pairs[0])
+    tasks = range(args.offset, args.offset + args.num)
+    if args.goal == -1:
+        goals = range(69)
+    else:
+        goals = [args.goal]
+    pairs = list(itertools.product(tasks, goals))
+    for pair in pairs:
+        GenerateTasksUnderGoal(args, nodes, hierarchy, session, valid_positions).generate(pair)
     # mp.Pool(8).map(
     #     GenerateTasksUnderGoal(args, nodes, hierarchy, session, valid_positions).generate,
     #     pairs

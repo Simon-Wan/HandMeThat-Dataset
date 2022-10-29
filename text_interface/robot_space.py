@@ -28,20 +28,20 @@ ACTION_ARGS = {
 }
 
 
-def set_up_planning_env(object_dict, domain):
-    names, state, translator, rel_types = define_robot_space(object_dict, domain)
-    action_ops = domain.operators.values()
+def set_up_planning_env(object_dict, session):
+    names, state, translator, rel_types = define_robot_space(object_dict, session)
+    action_ops = session.domain.operators.values()
     strips_state = translator.compile_state(state)
     return names, state, translator, rel_types, action_ops, strips_state
 
 
-def define_robot_space(object_dict, domain):
+def define_robot_space(object_dict, session):
     names = list(object_dict.keys())
     num_of_obj = len(names)
     names = ['r', 'h'] + names
     types = ['robot', 'phyobj'] + ['phyobj' for _ in range(num_of_obj)]
-    state = pds.State([domain.types[t] for t in types], object_names=names)
-    ctx = state.define_context(domain)
+    state = pds.State([session.domain.types[t] for t in types], object_names=names)
+    ctx = state.define_context(session.domain)
     predicates = robot_generate_predicates(ctx, object_dict)
 
     predicates.append(ctx.hand_empty('r'))
@@ -49,7 +49,7 @@ def define_robot_space(object_dict, domain):
     predicates.append(ctx.type_human('h'))
 
     ctx.define_predicates(predicates)
-    translator = pds.strips.GStripsTranslator(domain, use_string_name=True)
+    translator = pds.strips.GStripsTranslator(session, use_string_name=True)
     rel_types = {'LOCATION': [], 'RECEPTACLE': [], 'FOOD': [], 'TOOL': [], 'THING': []}
     for obj in object_dict.keys():
         rel_types[object_dict[obj]['class']].append(obj)

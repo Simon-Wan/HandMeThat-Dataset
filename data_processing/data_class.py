@@ -1,4 +1,5 @@
 import json
+import os.path as osp
 
 
 class Data:
@@ -21,6 +22,9 @@ class Data:
 
         self._subgoal = None
         self.demo_actions = list()
+        self.demo_observations_partially = list()
+        self.demo_observations_fully = list()
+        self.task_description = None
 
     def append_action(self, action_name, arguments):
         self.action_list.append({'name': action_name, 'arguments': arguments})
@@ -55,12 +59,12 @@ class Data:
         return self._objects_in_meaning
 
 
-def generate_json(data, quest_type, root='./'):
+def generate_json(data, quest_type, root):
     if data.goal_idx is not None:
         goal = data.goal_idx
     else:
         goal = ''
-    json_file = root + "task_{}_{}_{}({}).json".format(quest_type, goal, data.task_idx, data.level)
+    json_file = osp.join(root, "task-{}-{}-{}-{}.json".format(quest_type, goal, data.task_idx, data.level))
     with open(json_file, "w+") as f:
         json.dump(data.__dict__, f)
     return
@@ -69,13 +73,20 @@ def generate_json(data, quest_type, root='./'):
 def load_from_json(file):
     with open(file, 'r') as f:
         json_str = json.load(f)
+    goal_idx = json_str['goal_idx']
     task_idx = json_str['task_idx']
     initial_object_dict = json_str['initial_object_dict']
     goal = json_str['_goal']
+    subgoal = json_str['_subgoal']
+
     data = Data(task_idx, initial_object_dict, goal)
+    data.goal_idx = goal_idx
+    data.set_subgoal(subgoal)
     data.action_list = json_str['action_list']
     data.current_object_dict = json_str['current_object_dict']
     data.set_utterance(json_str['utterance'])
     data.set_private(json_str['_meaning'], json_str['_possible_solution'], json_str['_rsa_meaning'])
-    data.set_answer_objects(json_str['_objects_in_utterance'], json_str['_objects_in_meaning'], json_str['_objects_in_rsa_meaning'])
+    data.set_answer_objects(json_str['_objects_in_utterance'], json_str['_objects_in_meaning'],
+                            json_str['_useful_objects'], json_str['_objects_in_rsa_meaning'])
+    data.demo_actions = json_str['demo_actions']
     return data
