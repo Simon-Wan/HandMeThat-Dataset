@@ -103,7 +103,7 @@ def strips_heuristic_search(
                 yield action, action.apply(state), 1
 
     with jacinle.cond_with(pbar, verbose):
-        from hacl.algorithms.poc.heuristic_search import run_heuristic_search
+        from planning.heuristic_search import run_heuristic_search
         return run_heuristic_search(
             task.state,
             check_goal,
@@ -111,3 +111,6 @@ def strips_heuristic_search(
             get_successors,
             max_expansions=max_expansions
         )[1]
+
+
+

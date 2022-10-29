@@ -2,7 +2,7 @@ import pdsketch as pds
 import numpy as np
 from utils import obj_in_dict, dict_dominate_dict, power_set
 import math
-from rsa_utils import *
+from pragmatic_reasoning.rsa_utils import *
 
 INF = 1000
 ability_verb_mapping = {'toggleable': 'toggle', 'cookable': 'heat', 'freezable': 'cool', 'sliceable': 'slice',
@@ -141,7 +141,7 @@ def get_robot_operators_upon_goal(cur_extended_state, translator, strips_operato
 
         robot_operators_dict[op_type][(obj_name, arg)] = op
 
-        cur_task = pds.strips.StripsTask(op.apply(cur_extended_state), strips_goal, strips_operators, is_relaxed=False)
+        cur_task = pds.strips.GStripsTask(op.apply(cur_extended_state), strips_goal, strips_operators, is_relaxed=False)
         cur_task = translator.relevance_analysis(cur_task)
         cur_task = cur_task.compile()
         heuristic = pds.strips.StripsHFFHeuristic(cur_task, translator)

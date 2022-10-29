@@ -5,26 +5,8 @@ from pdsketch.value import ObjectType, NamedValueType, NamedValueTypeSlot
 from pdsketch.state import State
 from pdsketch.domain import Domain
 from pdsketch.operator import OperatorApplier
-from pdsketch.expr import ExpressionExecutionContext, is_simple_bool, get_simple_bool_def
-
-
-def filter_static_grounding(domain, state, actions):
-    output_actions = list()
-    for action in actions:
-        ctx = ExpressionExecutionContext(domain, state,
-                                         bounded_variables=state.compose_bounded_variables(action.operator.arguments,
-                                                                                           action.arguments))
-        flag = True
-        with ctx.as_default():
-            for pre in action.operator.preconditions:
-                if is_simple_bool(pre.bool_expr) and get_simple_bool_def(pre.bool_expr).static:
-                    rv = pre.bool_expr.forward(ctx).item()
-                    if rv < 0.5:
-                        flag = False
-                        break
-        if flag:
-            output_actions.append(action)
-    return output_actions
+from pdsketch.session import Session
+from pdsketch.strips.grounding import filter_static_grounding
 
 
 def generate_predicates(ctx, object_dict):
@@ -105,17 +87,21 @@ ACTION_ARGS = {
 
 
 def generate_relevant_partially_grounded_actions(
-        domain: Domain,
-        state: State,
-        rel_types: Dict,
-        action_names: Optional[Sequence[str]] = None,
-        action_filter: Optional[Callable[[OperatorApplier], bool]] = None,
-        filter_static: Optional[bool] = True
+    session: Session,
+    state: State,
+    rel_types: Dict,
+    action_names: Optional[Sequence[str]] = None,
+    action_filter: Optional[Callable[[OperatorApplier], bool]] = None,
+    filter_static: Optional[bool] = True
 ) -> List[OperatorApplier]:
+
+    assert isinstance(session, Session)
+
     if action_names is not None:
-        action_ops = [domain.operators[x] for x in action_names]
+        action_ops = [session.domain.operators[x] for x in action_names]
     else:
-        action_ops = domain.operators.values()
+        action_ops = session.domain.operators.values()
+
     rel = dict()
     rel['human'] = ['h']
     rel['location'] = rel_types['LOCATION']
@@ -128,23 +114,24 @@ def generate_relevant_partially_grounded_actions(
     rel['movable'] = rel['receptacle'] + rel['other']
     rel['all'] = rel['movable'] + rel['location']
     rel['movable_cleanable'] = rel['receptacle'] + rel['thing']
+
     actions = list()
     for op in action_ops:
         argument_candidates = list()
         for idx, arg in enumerate(op.arguments):
-            if isinstance(arg.type, ObjectType):
-                candidates = state.object_type2name[arg.type.typename]
+            if isinstance(arg.dtype, ObjectType):
+                candidates = state.object_type2names[arg.dtype.typename]
                 type_class = ACTION_ARGS[op.name][idx]
                 relevant_candidates = rel_analysis(candidates, rel[type_class])
                 argument_candidates.append(relevant_candidates)
             else:
-                assert isinstance(arg.type, NamedValueType)
-                argument_candidates.append([NamedValueTypeSlot(arg.type)])
+                assert isinstance(arg.dtype, NamedValueType)
+                argument_candidates.append([NamedValueTypeSlot(arg.dtype)])
         for comb in itertools.product(*argument_candidates):
             actions.append(op(*comb))
 
     if filter_static:
-        actions = filter_static_grounding(domain, state, actions)
+        actions = filter_static_grounding(session, state, actions)
     if action_filter is not None:
         actions = list(filter(action_filter, actions))
     return actions

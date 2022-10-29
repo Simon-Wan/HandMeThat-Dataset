@@ -1,5 +1,5 @@
 import numpy as np
-from goal_utils import *
+from sampling.goal_utils import *
 
 
 # goal input example

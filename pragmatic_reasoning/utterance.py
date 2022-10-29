@@ -1,4 +1,4 @@
-from rsa_utils import *
+from pragmatic_reasoning.rsa_utils import *
 import numpy as np
 
 

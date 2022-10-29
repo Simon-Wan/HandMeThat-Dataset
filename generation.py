@@ -17,14 +17,14 @@ from pragmatic_reasoning.utterance import get_all_utterances, remove_low_probs
 from pragmatic_reasoning.rsa import sample_meaning, get_utterance, estimate_meaning
 
 
-def sample_and_define_scene(nodes, hierarchy, domain, valid_positions):
+def sample_and_define_scene(nodes, hierarchy, session, valid_positions):
     object_dict, object_names = sample_scene(hierarchy, nodes, valid_positions)
     names = list(object_dict.keys())
     num_of_obj = len(names)
     names = ['h'] + names
     types = ['human'] + ['phyobj' for _ in range(num_of_obj)]
-    state = pds.State([domain.types[t] for t in types], object_names=names)
-    ctx = state.define_context(domain)
+    state = pds.State([session.domain.types[t] for t in types], object_names=names)
+    ctx = state.define_context(session.domain)
     predicates = generate_predicates(ctx, object_dict)
 
     predicates.append(ctx.is_working('h'))
@@ -32,11 +32,11 @@ def sample_and_define_scene(nodes, hierarchy, domain, valid_positions):
     predicates.append(ctx.human_at('h', 'floor'))
 
     ctx.define_predicates(predicates)
-    translator = pds.strips.GStripsTranslator(domain, use_string_name=True)
+    translator = pds.strips.GStripsTranslator(session, use_string_name=True)
     return state, translator, object_dict, object_names, names
 
 
-def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarchy, domain, valid_positions):
+def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarchy, session, valid_positions):
     """
     Generate one episode given goal template and quest type
     :param data_dir: path to save the raw json file
@@ -48,7 +48,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
     while True:
         print("Try task {}_{}_{}!".format(quest_type, goal_idx, task_idx))
         state, translator, object_dict, object_names, strips_names = \
-            sample_and_define_scene(nodes, hierarchy, domain, valid_positions)
+            sample_and_define_scene(nodes, hierarchy, session, valid_positions)
         cur_goal = generate_one_goal(object_dict, object_names, goal_idx)
         if not cur_goal.valid:
             print('Goal not valid!')
@@ -56,7 +56,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
         if 'floor' not in cur_goal.rel_types['LOCATION']:
             cur_goal.rel_types['LOCATION'].append('floor')
 
-        actions = generate_relevant_partially_grounded_actions(translator.domain, state, cur_goal.rel_types,
+        actions = generate_relevant_partially_grounded_actions(translator.session, state, cur_goal.rel_types,
                                                                filter_static=True)
         strips_state = translator.compile_state(state)
         strips_operators = [translator.compile_operator(op, state, is_relaxed=False) for op in actions]
@@ -176,24 +176,24 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
         new_data.set_answer_objects(objects_in_utterance, objects_in_meaning, useful_objects[quest_type],
                                     objects_in_rsa_meaning)
         new_data.goal_idx = goal_idx
-        generate_json(new_data, quest_type, root)
+        generate_json(new_data, quest_type, osp.join(root, 'raw_data'))
         print("Task {}_{}_{} finished!".format(quest_type, goal_idx, task_idx))
         task_idx += 1
         return new_data
 
 
 class GenerateTasksUnderGoal(object):
-    def __init__(self, args, nodes, hierarchy, domain, valid_positions):
+    def __init__(self, args, nodes, hierarchy, session, valid_positions):
         self.dirname = args.dirname
         self.quest_type = args.quest_type
         self.nodes = nodes
         self.hierarchy = hierarchy
-        self.domain = domain
+        self.session = session
         self.valid_positions = valid_positions
 
     def generate(self, pair):   # (task_idx, goal_idx)
         generation_process(self.dirname, pair[0], pair[1], self.quest_type,
-                           self.nodes, self.hierarchy, self.domain, self.valid_positions)
+                           self.nodes, self.hierarchy, self.session, self.valid_positions)
 
 
 if __name__ == '__main__':
@@ -203,15 +203,17 @@ if __name__ == '__main__':
     parser.add_argument('--quest_type', type=str, default='bring_me', help='type of instruction')
     args = parser.parse_args()
 
-    nodes, hierarchy = hierarchy2json(filename=osp.join(root, 'sampling', 'object_hierarchy'), save_json=False)
+    hierarchy, nodes = hierarchy2json(filename=osp.join(root, 'sampling', 'object_hierarchy'), save_json=False)
     valid_positions = get_valid_positions(nodes, filename=osp.join(root, 'sampling', 'object_sample_space'))
-    domain = pds.load_domain_file(root + 'domain.pddl')
+    domain = pds.load_domain_file(osp.join(root, 'domain.pddl'))
+    session = pds.Session(domain)
 
     tasks = range(1000)
     goals = [0]
     pairs = list(itertools.product([0], [0]))
-    mp.Pool(8).map(
-        GenerateTasksUnderGoal(args, nodes, hierarchy, domain, valid_positions).generate,
-        pairs
-    )
+    GenerateTasksUnderGoal(args, nodes, hierarchy, session, valid_positions).generate(pairs[0])
+    # mp.Pool(8).map(
+    #     GenerateTasksUnderGoal(args, nodes, hierarchy, session, valid_positions).generate,
+    #     pairs
+    # )
 

@@ -60,7 +60,7 @@ def generate_json(data, quest_type, root='./'):
         goal = data.goal_idx
     else:
         goal = ''
-    json_file = root + "json_files_{}/task_{}_{}_{}({}).json".format(quest_type, quest_type, goal, data.task_idx, data.level) # todo
+    json_file = root + "task_{}_{}_{}({}).json".format(quest_type, goal, data.task_idx, data.level)
     with open(json_file, "w+") as f:
         json.dump(data.__dict__, f)
     return
