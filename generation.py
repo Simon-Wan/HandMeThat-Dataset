@@ -149,7 +149,7 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
 
         short_meanings, short_probs, short_utterances = remove_low_probs(meanings, probs, utterances, hierarchy)
         if not short_meanings:
-            print('Empty meaning pool error!')
+            print('Empty meaning pool!')
             continue
 
         meaning_idx, meaning = sample_meaning(short_meanings, short_probs)
@@ -157,8 +157,11 @@ def generation_process(data_dir, task_idx, goal_idx, quest_type, nodes, hierarch
 
         objects_in_meaning = get_objects_from_description(object_dict, meaning)
         # objects_in_meaning is A(m)
-
-        meaning_op = robot_operators_dict[quest_type][objects_in_meaning[0]]
+        if objects_in_meaning[0] in robot_operators_dict[quest_type].keys():
+            meaning_op = robot_operators_dict[quest_type][objects_in_meaning[0]]    # todo: debug
+        else:
+            print('Object in meaning not correct!')
+            continue
         subgoal_idx = get_subgoal(strips_subgoals, cur_extended_state, meaning_op, strips_operators, translator, subgoal_steps)
         if subgoal_idx == -1:
             print('Meaning not correct!')
